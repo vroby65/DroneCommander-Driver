@@ -1,0 +1,91 @@
+name: Build macOS release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git tag or commit to build
+        required: true
+        default: v1.0.0
+      release_version:
+        description: Version used in archive names
+        required: true
+        default: v1.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    env:
+      ARCH: ${{ matrix.arch }}
+      RELEASE_VERSION: ${{ inputs.release_version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify macOS toolchain
+        run: |
+          uname -a
+          go version
+          xcrun --sdk macosx --show-sdk-path
+          test "$(go env GOARCH)" = "$ARCH"
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build native binary
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=darwin GOARCH="$ARCH" go build \
+            -trimpath \
+            -tags="migrated_fynedo" \
+            -ldflags="-s -w" \
+            -o "dist/drone-commander-driver-macos-$ARCH" .
+          file "dist/drone-commander-driver-macos-$ARCH"
+          go version -m "dist/drone-commander-driver-macos-$ARCH"
+
+      - name: Package binary
+        run: |
+          bundle="DroneCommander-Driver-${RELEASE_VERSION}-macos-${ARCH}"
+          archive="${bundle}.tar.gz"
+          mkdir -p "dist/$bundle"
+          install -m 0755 \
+            "dist/drone-commander-driver-macos-$ARCH" \
+            "dist/$bundle/drone-commander-driver"
+          install -m 0644 README.md LICENSE "dist/$bundle/"
+          tar -C dist -czf "dist/$archive" "$bundle"
+          shasum -a 256 "dist/$archive" \
+            | sed "s#  dist/#  #" \
+            > "dist/$archive.sha256"
+          cd dist
+          shasum -a 256 -c "$archive.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
