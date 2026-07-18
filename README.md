@@ -1,46 +1,55 @@
 # Drone Commander Tello Driver
 
-Applicazione desktop nativa in Go che carica i programmi XML esportati da Drone Commander e li esegue su un Ryze/DJI Tello tramite Tello SDK 2.0. La GUI usa Fyne: si apre come una normale finestra desktop e non avvia un server HTTP o un browser.
+A native Go desktop application that loads XML programs exported by [Drone Commander](https://github.com/vroby65/DroneCommander) and runs them on a Ryze/DJI Tello through Tello SDK 2.0. The interface is built with Fyne, opens as a regular desktop window, and does not start a web server or browser.
 
-## Unita' indoor
+Drone Commander provides an [online editor and simulator](https://vroby65.github.io/DroneCommander/). Create and test a program in the browser, save it as an XML file, and open it in this driver for offline simulation or real flight.
 
-La conversione e' fissa:
+## Drone Commander Workflow
+
+1. Create the program in the [online editor](https://vroby65.github.io/DroneCommander/).
+2. Test it in the 3D simulator and select **Save** to export an XML file.
+3. Open the file in the driver and test it again in simulation mode.
+4. Connect the computer to the `TELLO-...` Wi-Fi network and run the program on the drone.
+
+## Indoor Units
+
+The conversion is fixed:
 
 ```text
-1 unita Drone Commander = 1 centimetro
+1 Drone Commander unit = 1 centimeter
 ```
 
-Il Tello accetta i movimenti lineari `up`, `down`, `left`, `right`, `forward` e `back` soltanto da 20 a 500 cm. Un blocco `Cammina 1`, quindi, viene fermato con un errore; per avanzare di 30 cm bisogna usare `Cammina 30`.
+The Tello accepts the linear commands `up`, `down`, `left`, `right`, `forward`, and `back` only for distances from 20 to 500 cm. A `Walk 1` block therefore stops with an error; use `Walk 30` to move forward by 30 cm.
 
-Il blocco `Ritorna alla base` torna alle coordinate X/Z iniziali mantenendo la quota corrente. Questa scelta evita di riprodurre indoor la vecchia quota simulata di 10 unita', che ora significherebbe appena 10 cm.
+The `Return to base` block returns to the initial X/Z coordinates while maintaining the current altitude. This avoids reproducing the simulator's legacy altitude of 10 units, which would mean only 10 cm indoors.
 
-Durante il volo il driver rifiuta inoltre quote programmate inferiori a 20 cm; per scendere sotto tale soglia bisogna usare il blocco `Atterra`.
+The driver also rejects programmed flight altitudes below 20 cm. Use the `Land` block to descend below that threshold.
 
-## Avvio
+## Run
 
-Requisiti per compilare: Go 1.22, un compilatore C e le librerie grafiche richieste da Fyne.
+Building requires Go 1.22, a C compiler, and the graphics libraries required by Fyne.
 
-Su Debian/Ubuntu:
+On Debian/Ubuntu:
 
 ```sh
 sudo apt-get install gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
-git clone git@github.com:vroby65/DroneCommander-Driver.git
+git clone https://github.com/vroby65/DroneCommander-Driver.git
 cd DroneCommander-Driver
 go run .
 ```
 
-Dalla finestra:
+In the application:
 
-1. scegli un file `.xml` salvato da Drone Commander;
-2. attiva **Modalita simulazione**, connettiti e prova il programma;
-3. per il volo reale collega il computer alla rete Wi-Fi `TELLO-...`, disattiva la simulazione e connettiti;
-4. verifica la soglia batteria e avvia il programma.
+1. Choose an XML file saved by Drone Commander.
+2. Enable simulation mode, connect, and test the program.
+3. For real flight, connect the computer to the `TELLO-...` Wi-Fi network, disable simulation mode, and connect to the drone.
+4. Check the minimum battery threshold and start the program.
 
-Il file [examples/quadrato.xml](examples/quadrato.xml) contiene un percorso indoor di 50 cm per lato da provare prima in simulazione.
+The [examples/quadrato.xml](examples/quadrato.xml) file contains a 50 cm square indoor route that can be tested in simulation mode first.
 
-## Compilazione
+## Build
 
-Piattaforma corrente:
+Current platform:
 
 ```sh
 make build
@@ -52,66 +61,70 @@ Linux AMD64:
 make build-linux
 ```
 
-Windows AMD64 da Linux richiede MinGW-w64:
+Building Windows AMD64 from Linux requires MinGW-w64:
 
 ```sh
 make build-windows
 ```
 
-macOS richiede una toolchain Apple compatibile. Da Linux il target usa Docker, l'immagine di `fyne-cross` e un SDK macOS estratto da Xcode/Command Line Tools:
+Building for macOS requires an Apple-compatible toolchain. On Linux, the target uses Docker, the `fyne-cross` image, and a macOS SDK extracted from Xcode or Command Line Tools:
 
 ```sh
-make build-macos MACOS_SDK_PATH=/percorso/MacOSX.sdk
+make build-macos MACOS_SDK_PATH=/path/to/MacOSX.sdk
 ```
 
-Fyne usa CGO per accedere alle API grafiche native. Per questo la semplice impostazione di `GOOS` non e' sufficiente: ogni target necessita del relativo compilatore C e dei rispettivi header/SDK. Su un Mac e' sufficiente usare `make build` per l'architettura locale.
+Fyne uses CGO to access native graphics APIs, so setting `GOOS` alone is not enough. Each target needs the appropriate C compiler and headers or SDK. On macOS, use `make build` to build for the local architecture.
 
-## Conversione dei comandi
+## Command Mapping
 
-| Blocco Drone Commander | Comando/comportamento Tello |
+| Drone Commander block | Tello command or behavior |
 |---|---|
-| Decolla / Atterra | `takeoff` / `land` |
-| Cammina | `forward` o `back`, valore in cm |
-| Scivola | `right` o `left`, valore in cm |
-| Cambia quota | `up` o `down`, valore in cm |
-| Vai a / Muovi di | rotazione e/o `go x y z speed` |
-| Curva / Curva assoluta | `curve x1 y1 z1 x2 y2 z2 speed` |
-| Imposta/cambia angolo | `cw` o `ccw` |
-| Velocita | centimetri al secondo, limitati a 10-100 |
-| Attendi | attesa locale, con keep-alive ogni 8 secondi |
-| Fumo | ignorato con una nota nel registro |
+| Take off / Land | `takeoff` / `land` |
+| Walk | `forward` or `back`, distance in cm |
+| Slide | `right` or `left`, distance in cm |
+| Set/change altitude | `up` or `down`, distance in cm |
+| Go to / Move by | rotation and/or `go x y z speed` |
+| Curve / Absolute curve | `curve x1 y1 z1 x2 y2 z2 speed` |
+| Set/change angle | `cw` or `ccw` |
+| Speed | centimeters per second, limited to 10-100 |
+| Wait | local delay with a keep-alive every 8 seconds |
+| Smoke | ignored with a note in the flight log |
 
-Il driver mantiene una posizione stimata per tradurre i movimenti assoluti. Il Tello standard non fornisce una posizione globale indoor senza riferimenti esterni: vento, urti e deriva possono rendere imprecisi `Vai a`, `Curva assoluta` e `Ritorna alla base`.
+The driver maintains an estimated position to translate absolute movements. A standard Tello does not provide a global indoor position without external references, so wind, impacts, and drift can make `Go to`, `Absolute curve`, and `Return to base` inaccurate.
 
-## Sicurezza
+## Safety
 
-- Provare ogni programma in simulazione.
-- Usare paraeliche e liberare completamente l'area indoor.
-- Impostare quote e distanze in centimetri, ricordando il minimo SDK di 20 cm per comando lineare.
-- Lasciare attivo l'atterraggio automatico finale.
-- **Stop / hovering** annulla il programma e invia `stop`.
-- **Atterra** annulla il programma e invia `land`.
-- **Arresto motori** invia `emergency`: il drone cade immediatamente.
+- Test every program in simulation mode.
+- Use propeller guards and completely clear the indoor flight area.
+- Enter altitudes and distances in centimeters, remembering the Tello SDK minimum of 20 cm per linear command.
+- Keep automatic landing enabled at the end of the program.
+- **Stop / hovering** cancels the program and sends `stop`.
+- **Land** cancels the program and sends `land`.
+- **Emergency motor stop** sends `emergency`: the drone falls immediately.
 
-L'esecuzione e' limitata a 10.000 blocchi per interrompere cicli non terminanti. I blocchi non supportati vengono segnalati prima del volo.
+Execution is limited to 10,000 blocks to stop non-terminating loops. Unsupported blocks are reported before flight.
 
-## Opzioni
+## Options
 
 ```text
--tello 192.168.10.1:8889     indirizzo UDP comandi
--state :8890                 bind locale per la telemetria
+-tello 192.168.10.1:8889     UDP command address
+-state :8890                 local telemetry bind address
 ```
 
-## Struttura
+## Project Structure
 
-- `desktopui/` — finestra nativa Fyne e selettore file;
-- `session/` — stato applicativo, connessione ed esecuzione;
-- `program/` — parser XML Blockly e interprete;
-- `flight/` — conversione dei blocchi in comandi Tello;
-- `tello/` — protocollo UDP, telemetria e simulatore offline.
+- `desktopui/` — native Fyne window and file selector;
+- `session/` — application state, connection, and execution;
+- `program/` — Blockly XML parser and interpreter;
+- `flight/` — conversion from blocks to Tello commands;
+- `tello/` — UDP protocol, telemetry, and offline simulator.
 
-## Test
+## Tests
 
 ```sh
 go test ./...
 ```
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
