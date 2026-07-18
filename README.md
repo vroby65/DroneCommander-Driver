@@ -1,6 +1,15 @@
 # Drone Commander Tello Driver
 
-Applicazione desktop nativa in Go che carica i programmi XML esportati da Drone Commander e li esegue su un Ryze/DJI Tello tramite Tello SDK 2.0. La GUI usa Fyne: si apre come una normale finestra desktop e non avvia un server HTTP o un browser.
+Applicazione desktop nativa in Go che carica i programmi XML esportati da [Drone Commander](https://github.com/vroby65/DroneCommander) e li esegue su un Ryze/DJI Tello tramite Tello SDK 2.0. La GUI usa Fyne: si apre come una normale finestra desktop e non avvia un server HTTP o un browser.
+
+Drone Commander mette a disposizione l'[editor e simulatore online](https://vroby65.github.io/DroneCommander/): il programma si crea e si prova nel browser, si salva come file XML e si apre in questo driver per la simulazione locale o il volo reale.
+
+## Flusso con Drone Commander
+
+1. crea il programma nell'[editor online](https://vroby65.github.io/DroneCommander/);
+2. provalo nel simulatore 3D e usa **Save** per esportarlo come file `.xml`;
+3. apri il file nel driver e ripeti la prova in **Modalita simulazione**;
+4. collega il computer alla rete Wi-Fi `TELLO-...` ed esegui il programma sul drone.
 
 ## Unita' indoor
 
@@ -24,7 +33,7 @@ Su Debian/Ubuntu:
 
 ```sh
 sudo apt-get install gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
-git clone git@github.com:vroby65/DroneCommander-Driver.git
+git clone https://github.com/vroby65/DroneCommander-Driver.git
 cd DroneCommander-Driver
 go run .
 ```
