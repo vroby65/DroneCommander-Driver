@@ -40,12 +40,31 @@ go run .
 
 In the application:
 
-1. Choose an XML file saved by Drone Commander.
-2. Enable simulation mode, connect, and test the program.
-3. For real flight, connect the computer to the `TELLO-...` Wi-Fi network, disable simulation mode, and connect to the drone.
-4. Check the minimum battery threshold and start the program.
+1. Choose the interface language. The driver supports the same languages as Drone Commander: English, Italiano, Français, Deutsch, Español, Português, العربية, 简体中文, 한국어, and 日本語. The system language is selected initially and the choice is remembered.
+2. Choose an XML file saved by Drone Commander.
+3. Enable simulation mode, connect, and test the program.
+4. For real flight, connect the computer to the `TELLO-...` Wi-Fi network, disable simulation mode, and connect to the drone.
+5. Check the minimum battery threshold and start the program.
 
 The [examples/quadrato.xml](examples/quadrato.xml) file contains a 50 cm square indoor route that can be tested in simulation mode first.
+
+## Text Command Editor
+
+The program editor opens ordinary flight programs as concise text instead of raw Blockly XML:
+
+```text
+TAKE_OFF
+SET_SPEED speed=3
+REPEAT times=4 {
+  WALK distance=50
+  CHANGE_ANGLE angle=90
+}
+LAND
+```
+
+Distances and altitudes are centimeters, angles are degrees, and `WAIT` uses seconds. Saving converts the text back into a Blockly XML workspace that Drone Commander can reopen. The `?` button lists every supported command and parameter.
+
+Programs containing advanced Blockly logic, variables, procedures, or non-literal expressions automatically open in the **Advanced XML** tab. The driver never performs a lossy text conversion.
 
 ## Build
 
@@ -84,9 +103,9 @@ Fyne uses CGO to access native graphics APIs, so setting `GOOS` alone is not eno
 | Slide | `right` or `left`, distance in cm |
 | Set/change altitude | `up` or `down`, distance in cm |
 | Go to / Move by | rotation and/or `go x y z speed` |
-| Curve / Absolute curve | `curve x1 y1 z1 x2 y2 z2 speed` |
+| Curve / Absolute curve | `curve x1 y1 z1 x2 y2 z2 speed`; compatible `go` fallback when the firmware curve limits are not met |
 | Set/change angle | `cw` or `ccw` |
-| Speed | centimeters per second, limited to 10-100 |
+| Speed | Drone Commander range 0-10, mapped to 10-100 centimeters per second; default 3 = 30 cm/s (0 stops movement) |
 | Wait | local delay with a keep-alive every 8 seconds |
 | Smoke | ignored with a note in the flight log |
 
@@ -103,12 +122,14 @@ The driver maintains an estimated position to translate absolute movements. A st
 - **Emergency motor stop** sends `emergency`: the drone falls immediately.
 
 Execution is limited to 10,000 blocks to stop non-terminating loops. Unsupported blocks are reported before flight.
+Every flight action also writes a `STEP` analysis with duration and current telemetry to the persistent flight log.
 
 ## Options
 
 ```text
 -tello 192.168.10.1:8889     UDP command address
 -state :8890                 local telemetry bind address
+-log PATH                   persistent flight log (default: user config directory)
 ```
 
 ## Project Structure

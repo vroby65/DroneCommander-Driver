@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ type Client struct {
 	writeMu      sync.Mutex
 	stateMu      sync.RWMutex
 	state        Telemetry
+	speedCM      int
 	pendingDrain atomic.Bool
 	closed       chan struct{}
 	closeOnce    sync.Once
@@ -61,7 +63,7 @@ func NewClient(commandAddress, stateAddress string, timeout time.Duration) *Clie
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
-	return &Client{commandAddress: commandAddress, stateAddress: stateAddress, timeout: timeout, closed: make(chan struct{})}
+	return &Client{commandAddress: commandAddress, stateAddress: stateAddress, timeout: timeout, speedCM: 10, closed: make(chan struct{})}
 }
 
 // Connect opens command and state sockets and enters SDK mode.
@@ -90,15 +92,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.Close()
 		return fmt.Errorf("impossibile attivare la modalita SDK (verifica la rete Wi-Fi TELLO): %w", err)
 	}
-	response, err := c.Command(ctx, "battery?")
-	if err == nil {
-		if battery, parseErr := strconv.Atoi(strings.TrimSpace(response)); parseErr == nil {
-			c.stateMu.Lock()
-			c.state.Battery = battery
-			c.state.UpdatedAt = time.Now()
-			c.stateMu.Unlock()
-		}
-	}
+	_, _ = c.Command(ctx, "battery?")
 	return nil
 }
 
@@ -113,7 +107,9 @@ func (c *Client) Command(ctx context.Context, command string) (string, error) {
 		c.drainResponses(200 * time.Millisecond)
 	}
 
-	deadline := time.Now().Add(c.timeout)
+	started := time.Now()
+	commandTimeout := c.timeoutFor(command)
+	deadline := started.Add(commandTimeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
@@ -151,14 +147,86 @@ func (c *Client) Command(ctx context.Context, command string) (string, error) {
 	case result := <-read:
 		if result.err != nil {
 			c.pendingDrain.Store(true)
+			if timeout, ok := result.err.(net.Error); ok && timeout.Timeout() {
+				return "", fmt.Errorf("timeout Tello dopo %s per %q (il movimento potrebbe essere ancora in corso): %w", time.Since(started).Round(100*time.Millisecond), command, result.err)
+			}
 			return "", fmt.Errorf("risposta a %q: %w", command, result.err)
 		}
 		response := strings.TrimSpace(string(buffer[:result.n]))
 		if strings.HasPrefix(strings.ToLower(response), "error") {
 			return response, fmt.Errorf("il Tello ha rifiutato %q: %s", command, response)
 		}
+		c.recordResponse(command, response)
 		return response, nil
 	}
+}
+
+// timeoutFor allows movement commands enough time to finish before expecting
+// their acknowledgement. The base timeout remains appropriate for short SDK
+// queries, but a 500 cm walk at 10 cm/s legitimately takes about 50 seconds.
+func (c *Client) timeoutFor(command string) time.Duration {
+	fields := strings.Fields(strings.ToLower(command))
+	if len(fields) == 0 {
+		return c.timeout
+	}
+	withMargin := func(distance float64, speed int, factor float64) time.Duration {
+		if speed <= 0 {
+			speed = 10
+		}
+		seconds := distance / float64(speed) * factor
+		return max(c.timeout, time.Duration(math.Ceil(seconds))*time.Second+5*time.Second)
+	}
+	coordinate := func(index int) float64 {
+		if index >= len(fields) {
+			return 0
+		}
+		value, _ := strconv.ParseFloat(fields[index], 64)
+		return value
+	}
+	magnitude := func(x, y, z float64) float64 { return math.Sqrt(x*x + y*y + z*z) }
+
+	switch fields[0] {
+	case "takeoff", "land":
+		return max(c.timeout, 15*time.Second)
+	case "forward", "back", "left", "right", "up", "down":
+		return withMargin(math.Abs(coordinate(1)), c.speedCM, 1)
+	case "go":
+		speed := int(coordinate(4))
+		return withMargin(magnitude(coordinate(1), coordinate(2), coordinate(3)), speed, 1)
+	case "curve":
+		x1, y1, z1 := coordinate(1), coordinate(2), coordinate(3)
+		x2, y2, z2 := coordinate(4), coordinate(5), coordinate(6)
+		pathEstimate := magnitude(x1, y1, z1) + magnitude(x2-x1, y2-y1, z2-z1)
+		return withMargin(pathEstimate, int(coordinate(7)), 1.5)
+	default:
+		return c.timeout
+	}
+}
+
+// recordResponse keeps explicitly queried values in the same snapshot used by
+// the UI and remembers the speed needed to estimate later movement durations.
+func (c *Client) recordResponse(command, response string) {
+	fields := strings.Fields(strings.ToLower(command))
+	if len(fields) == 0 {
+		return
+	}
+	if fields[0] == "speed" && len(fields) > 1 {
+		if speed, err := strconv.Atoi(fields[1]); err == nil && speed > 0 {
+			c.speedCM = speed
+		}
+		return
+	}
+	if fields[0] != "battery?" {
+		return
+	}
+	battery, err := strconv.Atoi(strings.TrimSpace(response))
+	if err != nil {
+		return
+	}
+	c.stateMu.Lock()
+	c.state.Battery = battery
+	c.state.UpdatedAt = time.Now()
+	c.stateMu.Unlock()
 }
 
 // Immediate sends a safety command without waiting behind a running command.
@@ -286,6 +354,7 @@ func (s *Simulator) Command(_ context.Context, command string) (string, error) {
 		return "", errors.New("simulatore disconnesso")
 	}
 	if command == "battery?" {
+		s.state.UpdatedAt = time.Now()
 		return strconv.Itoa(s.state.Battery), nil
 	}
 	fields := strings.Fields(command)
@@ -305,6 +374,26 @@ func (s *Simulator) Command(_ context.Context, command string) (string, error) {
 				v, _ := strconv.Atoi(fields[1])
 				s.state.Height = max(0, s.state.Height-v)
 			}
+		case "go":
+			if len(fields) > 3 {
+				up, _ := strconv.Atoi(fields[3])
+				s.state.Height = max(0, s.state.Height+up)
+			}
+		case "curve":
+			if len(fields) > 6 {
+				finalUp, _ := strconv.Atoi(fields[6])
+				s.state.Height = max(0, s.state.Height+finalUp)
+			}
+		case "cw":
+			if len(fields) > 1 {
+				degrees, _ := strconv.Atoi(fields[1])
+				s.state.Yaw = signedYaw(s.state.Yaw + degrees)
+			}
+		case "ccw":
+			if len(fields) > 1 {
+				degrees, _ := strconv.Atoi(fields[1])
+				s.state.Yaw = signedYaw(s.state.Yaw - degrees)
+			}
 		}
 	}
 	s.state.UpdatedAt = time.Now()
@@ -316,3 +405,7 @@ func (s *Simulator) Immediate(command string) error {
 }
 func (s *Simulator) Snapshot() Telemetry { s.mu.Lock(); defer s.mu.Unlock(); return s.state }
 func (s *Simulator) Close() error        { s.mu.Lock(); defer s.mu.Unlock(); s.closed = true; return nil }
+
+func signedYaw(degrees int) int {
+	return ((degrees+180)%360+360)%360 - 180
+}
