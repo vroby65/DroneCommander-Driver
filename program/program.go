@@ -8,14 +8,17 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Field is a Blockly field. Variable fields also carry a stable ID.
 type Field struct {
 	Name  string `xml:"name,attr"`
-	ID    string `xml:"id,attr"`
+	ID    string `xml:"id,attr,omitempty"`
 	Value string `xml:",chardata"`
 }
 
@@ -75,8 +78,10 @@ func (n *Next) Selected() *Block {
 // Block is the subset of Blockly XML needed by the interpreter.
 type Block struct {
 	Type       string    `xml:"type,attr"`
-	ID         string    `xml:"id,attr"`
-	Disabled   string    `xml:"disabled,attr"`
+	ID         string    `xml:"id,attr,omitempty"`
+	X          string    `xml:"x,attr,omitempty"`
+	Y          string    `xml:"y,attr,omitempty"`
+	Disabled   string    `xml:"disabled,attr,omitempty"`
 	Fields     []Field   `xml:"field"`
 	Values     []Slot    `xml:"value"`
 	Statements []Slot    `xml:"statement"`
@@ -91,7 +96,11 @@ func (b *Block) IsDisabled() bool {
 func (b *Block) Field(name string) Field {
 	for _, field := range b.Fields {
 		if field.Name == name {
-			field.Value = strings.TrimSpace(field.Value)
+			// Whitespace is data in Blockly text literals; other fields are
+			// identifiers, modes, or numbers and may be normalized safely.
+			if field.Name != "TEXT" {
+				field.Value = strings.TrimSpace(field.Value)
+			}
 			return field
 		}
 	}
@@ -162,6 +171,8 @@ var statementTypes = map[string]bool{
 	"controls_whileUntil": true, "controls_for": true,
 	"controls_forEach": true, "controls_flow_statements": true,
 	"variables_set": true, "math_change": true,
+	"text_append": true, "text_print": true,
+	"lists_getIndex": true, "lists_setIndex": true,
 	"procedures_defnoreturn": true, "procedures_defreturn": true,
 	"procedures_callnoreturn": true, "procedures_ifreturn": true,
 }
@@ -169,15 +180,19 @@ var statementTypes = map[string]bool{
 var expressionTypes = map[string]bool{
 	"math_number": true, "math_arithmetic": true, "math_single": true,
 	"math_trig": true, "math_constant": true, "math_number_property": true,
-	"math_round": true, "math_modulo": true, "math_constrain": true,
+	"math_round": true, "math_on_list": true, "math_modulo": true, "math_constrain": true,
 	"math_random_int": true, "math_random_float": true,
 	"logic_boolean": true, "logic_compare": true, "logic_operation": true,
 	"logic_negate": true, "logic_null": true, "logic_ternary": true,
 	"variables_get": true, "text": true, "text_join": true,
-	"text_length": true, "text_isEmpty": true,
+	"text_length": true, "text_isEmpty": true, "text_indexOf": true,
+	"text_charAt": true, "text_getSubstring": true,
+	"text_changeCase": true, "text_trim": true,
 	"lists_create_with": true, "lists_repeat": true, "lists_length": true,
-	"lists_isEmpty": true, "procedures_callreturn": true,
-	"sensor_keypressed": true, "sensor_x": true, "sensor_z": true,
+	"lists_isEmpty": true, "lists_indexOf": true, "lists_getIndex": true,
+	"lists_getSublist": true, "lists_split": true, "lists_sort": true,
+	"procedures_callreturn": true,
+	"sensor_keypressed":     true, "sensor_x": true, "sensor_z": true,
 	"sensor_altitude": true, "sensor_direction": true, "sensor_speed": true,
 }
 
@@ -375,6 +390,28 @@ func (i *Interpreter) execBlock(ctx context.Context, block *Block) error {
 		key := variableKey(block.Field("VAR"))
 		i.vars[key] = number(i.vars[key]) + number(change)
 		return nil
+	case "text_append":
+		addition, err := i.eval(ctx, block.Value("TEXT"))
+		if err != nil {
+			return err
+		}
+		key := variableKey(block.Field("VAR"))
+		i.vars[key] = fmt.Sprint(i.vars[key]) + fmt.Sprint(addition)
+		return nil
+	case "text_print":
+		text, err := i.eval(ctx, block.Value("TEXT"))
+		if err != nil {
+			return err
+		}
+		return i.Host.Action(ctx, "text_print", map[string]Value{"TEXT": text})
+	case "lists_getIndex":
+		if block.Field("MODE").Value != "REMOVE" {
+			return fmt.Errorf("lists_getIndex usato come istruzione senza modalita REMOVE")
+		}
+		_, err := i.evalListGetIndex(ctx, block)
+		return err
+	case "lists_setIndex":
+		return i.execListSetIndex(ctx, block)
 	case "controls_if":
 		branches := 1 + intAttr(block.MutationAttr("elseif"))
 		for n := 0; n < branches; n++ {
@@ -727,6 +764,12 @@ func (i *Interpreter) eval(ctx context.Context, block *Block) (Value, error) {
 		return float64(low + rand.Intn(high-low+1)), nil
 	case "math_random_float":
 		return rand.Float64(), nil
+	case "math_on_list":
+		list, err := value("LIST")
+		if err != nil {
+			return nil, err
+		}
+		return mathOnList(block.Field("OP").Value, listValue(list)), nil
 	case "logic_compare":
 		a, err := value("A")
 		if err != nil {
@@ -802,6 +845,79 @@ func (i *Interpreter) eval(ctx context.Context, block *Block) (Value, error) {
 	case "text_isEmpty":
 		x, err := value("VALUE")
 		return len(fmt.Sprint(x)) == 0, err
+	case "text_indexOf":
+		text, err := value("VALUE")
+		if err != nil {
+			return nil, err
+		}
+		find, err := value("FIND")
+		if err != nil {
+			return nil, err
+		}
+		return float64(textIndexOf(fmt.Sprint(text), fmt.Sprint(find), block.Field("END").Value)), nil
+	case "text_charAt":
+		text, err := value("VALUE")
+		if err != nil {
+			return nil, err
+		}
+		where := block.Field("WHERE").Value
+		at, err := i.optionalIndex(ctx, block, "AT", where)
+		if err != nil {
+			return nil, err
+		}
+		runes := []rune(fmt.Sprint(text))
+		index := blocklyIndex(where, at, len(runes), false)
+		if index < 0 || index >= len(runes) {
+			return "", nil
+		}
+		return string(runes[index]), nil
+	case "text_getSubstring":
+		text, err := value("STRING")
+		if err != nil {
+			return nil, err
+		}
+		runes := []rune(fmt.Sprint(text))
+		startAt, err := i.optionalIndex(ctx, block, "AT1", block.Field("WHERE1").Value)
+		if err != nil {
+			return nil, err
+		}
+		endAt, err := i.optionalIndex(ctx, block, "AT2", block.Field("WHERE2").Value)
+		if err != nil {
+			return nil, err
+		}
+		start := blocklyIndex(block.Field("WHERE1").Value, startAt, len(runes), false)
+		end := blocklyIndex(block.Field("WHERE2").Value, endAt, len(runes), false)
+		start, end = boundedRange(start, end, len(runes))
+		if start >= end {
+			return "", nil
+		}
+		return string(runes[start:end]), nil
+	case "text_changeCase":
+		text, err := value("TEXT")
+		if err != nil {
+			return nil, err
+		}
+		switch block.Field("CASE").Value {
+		case "UPPERCASE":
+			return strings.ToUpper(fmt.Sprint(text)), nil
+		case "LOWERCASE":
+			return strings.ToLower(fmt.Sprint(text)), nil
+		case "TITLECASE":
+			return titleCase(fmt.Sprint(text)), nil
+		}
+	case "text_trim":
+		text, err := value("TEXT")
+		if err != nil {
+			return nil, err
+		}
+		switch block.Field("MODE").Value {
+		case "LEFT":
+			return strings.TrimLeftFunc(fmt.Sprint(text), unicode.IsSpace), nil
+		case "RIGHT":
+			return strings.TrimRightFunc(fmt.Sprint(text), unicode.IsSpace), nil
+		default:
+			return strings.TrimSpace(fmt.Sprint(text)), nil
+		}
 	case "lists_create_with":
 		count := intAttr(block.MutationAttr("items"))
 		items := make([]Value, 0, count)
@@ -828,11 +944,91 @@ func (i *Interpreter) eval(ctx context.Context, block *Block) (Value, error) {
 		}
 		return items, nil
 	case "lists_length":
-		list, err := value("VALUE")
-		return float64(len(listValue(list))), err
+		collection, err := value("VALUE")
+		return float64(collectionLength(collection)), err
 	case "lists_isEmpty":
+		collection, err := value("VALUE")
+		return collectionLength(collection) == 0, err
+	case "lists_indexOf":
 		list, err := value("VALUE")
-		return len(listValue(list)) == 0, err
+		if err != nil {
+			return nil, err
+		}
+		find, err := value("FIND")
+		if err != nil {
+			return nil, err
+		}
+		items := listValue(list)
+		index := -1
+		if block.Field("END").Value == "LAST" {
+			for n := len(items) - 1; n >= 0; n-- {
+				if reflect.DeepEqual(items[n], find) {
+					index = n
+					break
+				}
+			}
+		} else {
+			for n, item := range items {
+				if reflect.DeepEqual(item, find) {
+					index = n
+					break
+				}
+			}
+		}
+		return float64(index + 1), nil
+	case "lists_getIndex":
+		return i.evalListGetIndex(ctx, block)
+	case "lists_getSublist":
+		list, err := value("LIST")
+		if err != nil {
+			return nil, err
+		}
+		items := listValue(list)
+		startAt, err := i.optionalIndex(ctx, block, "AT1", block.Field("WHERE1").Value)
+		if err != nil {
+			return nil, err
+		}
+		endAt, err := i.optionalIndex(ctx, block, "AT2", block.Field("WHERE2").Value)
+		if err != nil {
+			return nil, err
+		}
+		start := blocklyIndex(block.Field("WHERE1").Value, startAt, len(items), false)
+		end := blocklyIndex(block.Field("WHERE2").Value, endAt, len(items), false)
+		start, end = boundedRange(start, end, len(items))
+		if start >= end {
+			return []Value{}, nil
+		}
+		return append([]Value(nil), items[start:end]...), nil
+	case "lists_split":
+		input, err := value("INPUT")
+		if err != nil {
+			return nil, err
+		}
+		delimiter, err := value("DELIM")
+		if err != nil {
+			return nil, err
+		}
+		separator := fmt.Sprint(delimiter)
+		if block.Field("MODE").Value == "JOIN" {
+			items := listValue(input)
+			parts := make([]string, len(items))
+			for n, item := range items {
+				parts[n] = fmt.Sprint(item)
+			}
+			return strings.Join(parts, separator), nil
+		}
+		parts := strings.Split(fmt.Sprint(input), separator)
+		items := make([]Value, len(parts))
+		for n, part := range parts {
+			items[n] = part
+		}
+		return items, nil
+	case "lists_sort":
+		list, err := value("LIST")
+		if err != nil {
+			return nil, err
+		}
+		return sortList(listValue(list), block.Field("TYPE").Value, block.Field("DIRECTION").Value), nil
 	case "math_number_property":
 		x, err := value("NUMBER_TO_CHECK")
 		if err != nil {
@@ -860,6 +1056,264 @@ func (i *Interpreter) eval(ctx context.Context, block *Block) (Value, error) {
 		return i.callProcedure(ctx, block)
 	}
 	return nil, fmt.Errorf("espressione non supportata: %s", block.Type)
+}
+
+func (i *Interpreter) optionalIndex(ctx context.Context, block *Block, input, where string) (float64, error) {
+	if where != "FROM_START" && where != "FROM_END" {
+		return 0, nil
+	}
+	value, err := i.eval(ctx, block.Value(input))
+	return number(value), err
+}
+
+func (i *Interpreter) evalListGetIndex(ctx context.Context, block *Block) (Value, error) {
+	source := block.Value("VALUE")
+	value, err := i.eval(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	items := listValue(value)
+	where := block.Field("WHERE").Value
+	at, err := i.optionalIndex(ctx, block, "AT", where)
+	if err != nil {
+		return nil, err
+	}
+	index := blocklyIndex(where, at, len(items), false)
+	if index < 0 || index >= len(items) {
+		return nil, nil
+	}
+	result := items[index]
+	mode := block.Field("MODE").Value
+	if mode == "GET_REMOVE" || mode == "REMOVE" {
+		items = append(items[:index], items[index+1:]...)
+		i.storeList(source, items)
+	}
+	if mode == "REMOVE" {
+		return nil, nil
+	}
+	return result, nil
+}
+
+func (i *Interpreter) execListSetIndex(ctx context.Context, block *Block) error {
+	source := block.Value("LIST")
+	value, err := i.eval(ctx, source)
+	if err != nil {
+		return err
+	}
+	item, err := i.eval(ctx, block.Value("TO"))
+	if err != nil {
+		return err
+	}
+	items := listValue(value)
+	where := block.Field("WHERE").Value
+	at, err := i.optionalIndex(ctx, block, "AT", where)
+	if err != nil {
+		return err
+	}
+	insert := block.Field("MODE").Value == "INSERT"
+	index := blocklyIndex(where, at, len(items), insert)
+	if insert {
+		index = max(0, min(len(items), index))
+		items = append(items, nil)
+		copy(items[index+1:], items[index:])
+		items[index] = item
+	} else {
+		if index < 0 {
+			return nil
+		}
+		if index >= len(items) {
+			items = append(items, make([]Value, index-len(items)+1)...)
+		}
+		items[index] = item
+	}
+	i.storeList(source, items)
+	return nil
+}
+
+func (i *Interpreter) storeList(source *Block, items []Value) {
+	if source != nil && source.Type == "variables_get" {
+		i.vars[variableKey(source.Field("VAR"))] = items
+	}
+}
+
+func blocklyIndex(where string, at float64, length int, insertion bool) int {
+	switch where {
+	case "FIRST":
+		return 0
+	case "LAST":
+		if insertion {
+			return length
+		}
+		return length - 1
+	case "FROM_END":
+		return length - int(math.Floor(at))
+	case "RANDOM":
+		if length == 0 {
+			return 0
+		}
+		return rand.Intn(length)
+	default: // FROM_START
+		return int(math.Floor(at)) - 1
+	}
+}
+
+// boundedRange converts Blockly's inclusive start/end indexes to a bounded Go
+// half-open slice range.
+func boundedRange(start, end, length int) (int, int) {
+	start = max(0, min(length, start))
+	end = max(0, min(length, end+1))
+	return start, end
+}
+
+func textIndexOf(text, find, end string) int {
+	byteIndex := strings.Index(text, find)
+	if end == "LAST" {
+		byteIndex = strings.LastIndex(text, find)
+	}
+	if byteIndex < 0 {
+		return 0
+	}
+	return len([]rune(text[:byteIndex])) + 1
+}
+
+func titleCase(value string) string {
+	runes := []rune(strings.ToLower(value))
+	start := true
+	for index, r := range runes {
+		if unicode.IsSpace(r) {
+			start = true
+			continue
+		}
+		if start {
+			runes[index] = unicode.ToTitle(r)
+			start = false
+		}
+	}
+	return string(runes)
+}
+
+func mathOnList(operation string, items []Value) Value {
+	numbers := make([]float64, len(items))
+	for index, item := range items {
+		numbers[index] = number(item)
+	}
+	switch operation {
+	case "SUM":
+		return sum(numbers)
+	case "MIN":
+		if len(numbers) == 0 {
+			return math.Inf(1)
+		}
+		return slicesMin(numbers)
+	case "MAX":
+		if len(numbers) == 0 {
+			return math.Inf(-1)
+		}
+		return slicesMax(numbers)
+	case "AVERAGE":
+		if len(numbers) == 0 {
+			return float64(0)
+		}
+		return sum(numbers) / float64(len(numbers))
+	case "MEDIAN":
+		if len(numbers) == 0 {
+			return float64(0)
+		}
+		ordered := append([]float64(nil), numbers...)
+		sort.Float64s(ordered)
+		middle := len(ordered) / 2
+		if len(ordered)%2 == 1 {
+			return ordered[middle]
+		}
+		return (ordered[middle-1] + ordered[middle]) / 2
+	case "MODE":
+		counts := make(map[float64]int)
+		most := 0
+		for _, value := range numbers {
+			counts[value]++
+			most = max(most, counts[value])
+		}
+		modes := make([]Value, 0)
+		seen := make(map[float64]bool)
+		for _, value := range numbers {
+			if counts[value] == most && !seen[value] {
+				modes = append(modes, value)
+				seen[value] = true
+			}
+		}
+		return modes
+	case "STD_DEV":
+		if len(numbers) == 0 {
+			return float64(0)
+		}
+		mean := sum(numbers) / float64(len(numbers))
+		variance := 0.0
+		for _, value := range numbers {
+			variance += (value - mean) * (value - mean)
+		}
+		return math.Sqrt(variance / float64(len(numbers)))
+	case "RANDOM":
+		if len(items) == 0 {
+			return nil
+		}
+		return items[rand.Intn(len(items))]
+	}
+	return float64(0)
+}
+
+func sum(values []float64) float64 {
+	total := 0.0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func slicesMin(values []float64) float64 {
+	result := values[0]
+	for _, value := range values[1:] {
+		result = math.Min(result, value)
+	}
+	return result
+}
+
+func slicesMax(values []float64) float64 {
+	result := values[0]
+	for _, value := range values[1:] {
+		result = math.Max(result, value)
+	}
+	return result
+}
+
+func sortList(items []Value, kind, direction string) []Value {
+	result := append([]Value(nil), items...)
+	descending := direction == "-1"
+	sort.SliceStable(result, func(left, right int) bool {
+		comparison := 0
+		switch kind {
+		case "NUMERIC":
+			comparison = compare(number(result[left]), number(result[right]))
+		case "IGNORE_CASE":
+			comparison = strings.Compare(strings.ToLower(fmt.Sprint(result[left])), strings.ToLower(fmt.Sprint(result[right])))
+		default:
+			comparison = strings.Compare(fmt.Sprint(result[left]), fmt.Sprint(result[right]))
+		}
+		if descending {
+			return comparison > 0
+		}
+		return comparison < 0
+	})
+	return result
+}
+
+func compare(left, right float64) int {
+	if left < right {
+		return -1
+	}
+	if left > right {
+		return 1
+	}
+	return 0
 }
 
 func variableKey(field Field) string {
@@ -906,6 +1360,13 @@ func listValue(value Value) []Value {
 		return list
 	}
 	return nil
+}
+
+func collectionLength(value Value) int {
+	if text, ok := value.(string); ok {
+		return len([]rune(text))
+	}
+	return len(listValue(value))
 }
 func isPrime(value float64) bool {
 	n := int(value)

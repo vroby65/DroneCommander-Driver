@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,12 +16,11 @@ import (
 	"github.com/vroby65/DroneCommander-Driver/tello"
 )
 
-const CentimetersPerUnit = 1.0
-
 type Options struct {
 	CommandAddress string
 	StateAddress   string
 	CommandTimeout time.Duration
+	LogPath        string
 }
 
 type LogEntry struct {
@@ -42,6 +43,7 @@ type Snapshot struct {
 type RunConfig struct {
 	MinimumBattery int
 	AutoLand       bool
+	CollisionCheck bool
 }
 
 type Session struct {
@@ -58,6 +60,7 @@ type Session struct {
 	cancel      context.CancelFunc
 	lastError   string
 	logs        []LogEntry
+	logPath     string
 	keys        map[string]bool
 }
 
@@ -71,7 +74,7 @@ func New(options Options) *Session {
 	if options.CommandTimeout <= 0 {
 		options.CommandTimeout = 8 * time.Second
 	}
-	return &Session{options: options, keys: make(map[string]bool)}
+	return &Session{options: options, logPath: options.LogPath, keys: make(map[string]bool)}
 }
 
 func (s *Session) LoadProgram(name string, data []byte) error {
@@ -181,7 +184,15 @@ func (s *Session) Start(config RunConfig) error {
 	device := s.device
 	parsed := s.program
 	s.addLogLocked("Avvio programma " + s.programName + " (1 unita = 1 cm).")
-	controller := flight.NewController(device, flight.Config{CentimetersPerUnit: CentimetersPerUnit, MinimumBattery: config.MinimumBattery, KeyPressed: s.KeyPressed, Log: s.addLog})
+	if config.CollisionCheck {
+		s.addLogLocked("Controllo collisioni attivato.")
+	}
+	controller := flight.NewController(device, flight.Config{
+		MinimumBattery: config.MinimumBattery,
+		CollisionCheck: config.CollisionCheck,
+		KeyPressed:     s.KeyPressed,
+		Log:            s.addLog,
+	})
 	go s.execute(ctx, parsed, controller, device, config.AutoLand, runID)
 	return nil
 }
@@ -194,10 +205,7 @@ func (s *Session) execute(ctx context.Context, parsed *program.Program, controll
 		s.addLog("Programma completato.")
 		if autoLand && result.Flying {
 			s.addLog("Atterraggio automatico finale.")
-			landCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, landErr := device.Command(landCtx, "land")
-			cancel()
-			if landErr != nil {
+			if landErr := s.confirmedLand(device, false); landErr != nil {
 				err = fmt.Errorf("atterraggio automatico: %w", landErr)
 			}
 		}
@@ -206,11 +214,33 @@ func (s *Session) execute(ctx context.Context, parsed *program.Program, controll
 	} else {
 		s.addLog("Errore di esecuzione: " + err.Error())
 		_ = device.Immediate("stop")
-		if autoLand && result.Flying {
+		if result.Flying {
+			s.addLog("Atterraggio di sicurezza dopo l'errore.")
 			time.Sleep(250 * time.Millisecond)
-			_ = device.Immediate("land")
+			if landErr := s.confirmedLand(device, true); landErr != nil {
+				s.addLog("Atterraggio di sicurezza non confermato: " + landErr.Error())
+				err = fmt.Errorf("%w; atterraggio di sicurezza: %v", err, landErr)
+			}
 		}
 	}
+
+	// Refresh the displayed charge after every program run. Use a fresh context:
+	// the program context may have been cancelled by STOP or a manual landing,
+	// while the Tello connection is still available for this final read.
+	s.mu.Lock()
+	refreshBattery := s.runID == runID && s.connected
+	s.mu.Unlock()
+	if refreshBattery {
+		batteryCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		battery, batteryErr := controller.Battery(batteryCtx)
+		cancel()
+		if batteryErr != nil {
+			s.addLog("Lettura batteria dopo il volo non riuscita: " + batteryErr.Error())
+		} else {
+			s.addLog(fmt.Sprintf("Batteria dopo il volo: %d%%", battery))
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.runID != runID {
@@ -240,7 +270,29 @@ func (s *Session) Safety(command string) error {
 	if !connected || device == nil {
 		return errors.New("nessun Tello connesso")
 	}
+	if command == "land" {
+		return s.confirmedLand(device, true)
+	}
 	return device.Immediate(command)
+}
+
+// confirmedLand sends land immediately when requested, then sends it through
+// the serialized command path and waits for the drone's acknowledgement. The
+// second send also acts as a retry if the first UDP datagram was lost.
+func (s *Session) confirmedLand(device tello.Commander, immediate bool) error {
+	if immediate {
+		if err := device.Immediate("land"); err != nil {
+			return err
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	response, err := device.Command(ctx, "land")
+	if err != nil {
+		return err
+	}
+	s.addLog("Atterraggio confermato dal Tello: " + response)
+	return nil
 }
 
 func (s *Session) SetKey(key string, pressed bool) {
@@ -287,11 +339,53 @@ func (s *Session) Snapshot() Snapshot {
 	return snapshot
 }
 
+// ClearLogs clears both the in-memory flight history and the persistent log.
+// The session lock keeps this operation ordered with log messages produced by
+// a flight that may still be running.
+func (s *Session) ClearLogs() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.logPath == "" {
+		s.logs = nil
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(s.logPath), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(s.logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	s.logs = nil
+	return nil
+}
+
 func (s *Session) addLog(message string) { s.mu.Lock(); defer s.mu.Unlock(); s.addLogLocked(message) }
 func (s *Session) addLogLocked(message string) {
-	s.logs = append(s.logs, LogEntry{Time: time.Now().Format("15:04:05"), Message: message})
+	now := time.Now()
+	entry := LogEntry{Time: now.Format("15:04:05"), Message: message}
+	s.logs = append(s.logs, entry)
 	if len(s.logs) > 250 {
 		s.logs = append([]LogEntry(nil), s.logs[len(s.logs)-250:]...)
 	}
+	if s.logPath != "" {
+		_ = appendFlightLog(s.logPath, now, message)
+	}
+}
+
+func appendFlightLog(path string, timestamp time.Time, message string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = fmt.Fprintf(file, "%s %s\n", timestamp.Format(time.RFC3339), message)
+	return err
 }
 func (s *Session) Close() error { return s.Disconnect() }

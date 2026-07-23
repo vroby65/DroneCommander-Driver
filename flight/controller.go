@@ -15,10 +15,10 @@ import (
 )
 
 type Config struct {
-	CentimetersPerUnit float64
-	MinimumBattery     int
-	KeyPressed         func(string) bool
-	Log                func(string)
+	MinimumBattery int
+	CollisionCheck bool
+	KeyPressed     func(string) bool
+	Log            func(string)
 }
 
 type Result struct {
@@ -27,24 +27,28 @@ type Result struct {
 	Heading float64
 }
 
-const minimumIndoorAltitudeCM = 20.0
+const (
+	minimumIndoorAltitudeCM    = 20.0
+	minimumCollisionDistanceCM = 30.0
+)
 
-// Controller is a program.Host backed by a Tello commander.
+// Controller is a program.Host backed by a Tello commander. Linear values read
+// from Drone Commander XML remain centimeters and pass unchanged to the SDK.
 type Controller struct {
-	device    tello.Commander
-	config    Config
-	x, y, z   float64
-	heading   float64
-	speed     float64
-	speedSent bool
-	flying    bool
+	device      tello.Commander
+	config      Config
+	x, y, z     float64
+	heading     float64
+	speed       float64
+	speedSent   bool
+	flying      bool
+	lastBattery int
 }
 
+const defaultSpeed = 3.0
+
 func NewController(device tello.Commander, config Config) *Controller {
-	if config.CentimetersPerUnit <= 0 {
-		config.CentimetersPerUnit = 1
-	}
-	return &Controller{device: device, config: config, speed: 1}
+	return &Controller{device: device, config: config, speed: defaultSpeed}
 }
 
 func (c *Controller) Result() Result {
@@ -68,14 +72,22 @@ func (c *Controller) send(ctx context.Context, command string) error {
 	return nil
 }
 
-func (c *Controller) EnsureBattery(ctx context.Context) error {
+func (c *Controller) Battery(ctx context.Context) (int, error) {
 	response, err := c.device.Command(ctx, "battery?")
 	if err != nil {
-		return fmt.Errorf("lettura batteria: %w", err)
+		return 0, fmt.Errorf("lettura batteria: %w", err)
 	}
 	battery, err := strconv.Atoi(strings.TrimSpace(response))
 	if err != nil {
-		return fmt.Errorf("risposta batteria non valida: %q", response)
+		return 0, fmt.Errorf("risposta batteria non valida: %q", response)
+	}
+	return battery, nil
+}
+
+func (c *Controller) EnsureBattery(ctx context.Context) error {
+	battery, err := c.Battery(ctx)
+	if err != nil {
+		return err
 	}
 	if c.config.MinimumBattery > 0 && battery < c.config.MinimumBattery {
 		return fmt.Errorf("batteria al %d%%, sotto la soglia di sicurezza del %d%%", battery, c.config.MinimumBattery)
@@ -84,7 +96,9 @@ func (c *Controller) EnsureBattery(ctx context.Context) error {
 	return nil
 }
 
-func (c *Controller) Action(ctx context.Context, kind string, arguments map[string]program.Value) error {
+func (c *Controller) Action(ctx context.Context, kind string, arguments map[string]program.Value) (err error) {
+	started := time.Now()
+	defer func() { c.logStep(kind, started, err) }()
 	n := func(name string) float64 { return numeric(arguments[name]) }
 	switch kind {
 	case "take_off":
@@ -94,21 +108,28 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if err := c.EnsureBattery(ctx); err != nil {
 			return err
 		}
+		// The takeoff command may reach the drone even when its UDP response is
+		// lost. Mark the flight as active before sending it so error recovery
+		// still attempts to land.
+		c.flying = true
 		if err := c.send(ctx, "takeoff"); err != nil {
 			return err
 		}
-		c.flying = true
 		if c.speed > 0 && !c.speedSent {
 			if err := c.send(ctx, fmt.Sprintf("speed %d", c.speedCM(false))); err != nil {
 				return err
 			}
 			c.speedSent = true
 		}
-		height := c.device.Snapshot().Height
+		state := c.device.Snapshot()
+		height := state.Height
 		if height <= 0 {
 			height = 80
 		}
-		c.y = float64(height) / c.config.CentimetersPerUnit
+		c.y = float64(height)
+		// A controller is recreated for every run, but the real drone keeps its
+		// orientation after landing. Start absolute angles from the live yaw.
+		c.heading = normalize(float64(state.Yaw))
 		return nil
 	case "land":
 		if !c.flying {
@@ -144,6 +165,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		distance := n("DIST")
 		if err := c.directional(ctx, "forward", "back", distance); err != nil {
 			return err
@@ -154,6 +178,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		distance := n("SLIDE")
 		if err := c.directional(ctx, "right", "left", distance); err != nil {
 			return err
@@ -163,6 +190,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 	case "walk_climbing":
 		if !c.flying || c.speed == 0 {
 			return nil
+		}
+		if err := c.checkCollision(); err != nil {
+			return err
 		}
 		forward, up := n("DIST"), n("CLIMB")
 		if err := c.validateAltitude(c.y + up); err != nil {
@@ -177,6 +207,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		right, up, forward := n("X"), n("Y"), n("Z")
 		if err := c.validateAltitude(c.y + up); err != nil {
 			return err
@@ -190,10 +223,16 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		return c.goTo(ctx, n("X"), n("Y"), n("Z"))
 	case "return_to_base":
 		if !c.flying || c.speed == 0 {
 			return nil
+		}
+		if err := c.checkCollision(); err != nil {
+			return err
 		}
 		// Indoors, returning at the current height is safer than reproducing the
 		// simulator's legacy altitude of 10 units (now exactly 10 cm).
@@ -202,10 +241,16 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		return c.curveRelative(ctx, n("X"), n("Y"), n("Z"), n("XD"), n("YD"), n("ZD"))
 	case "curve_abs":
 		if !c.flying || c.speed == 0 {
 			return nil
+		}
+		if err := c.checkCollision(); err != nil {
+			return err
 		}
 		return c.curveAbsolute(ctx, n("X"), n("Y"), n("Z"), n("XD"), n("YD"), n("ZD"))
 	case "wait":
@@ -215,9 +260,60 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 	case "smoke":
 		c.log("Scia di fumo ignorata dal drone reale.")
 		return nil
+	case "text_print":
+		c.log("Stampa: " + fmt.Sprint(arguments["TEXT"]))
+		return nil
 	default:
 		return fmt.Errorf("azione drone sconosciuta: %s", kind)
 	}
+}
+
+func (c *Controller) checkCollision() error {
+	if !c.config.CollisionCheck {
+		return nil
+	}
+	distance, available := c.device.Snapshot().Values["tof"]
+	if !available || distance <= 0 || distance >= minimumCollisionDistanceCM {
+		return nil
+	}
+	err := fmt.Errorf("ostacolo rilevato a %.0f cm (distanza minima %.0f cm)", distance, minimumCollisionDistanceCM)
+	c.log("CONTROLLO COLLISIONI: " + err.Error() + "; movimento bloccato.")
+	return err
+}
+
+func (c *Controller) logStep(kind string, started time.Time, actionErr error) {
+	state := c.device.Snapshot()
+	status := "OK"
+	var findings []string
+	if actionErr != nil {
+		status = "ERRORE"
+		findings = append(findings, actionErr.Error())
+	}
+	if state.Battery > 0 {
+		if state.Battery <= 30 {
+			findings = append(findings, fmt.Sprintf("batteria bassa %d%%", state.Battery))
+		}
+		if c.lastBattery > 0 && c.lastBattery-state.Battery >= 5 {
+			findings = append(findings, fmt.Sprintf("calo batteria %d%%→%d%%", c.lastBattery, state.Battery))
+		}
+		c.lastBattery = state.Battery
+	}
+	if !state.UpdatedAt.IsZero() && time.Since(state.UpdatedAt) > 3*time.Second {
+		findings = append(findings, "telemetria non aggiornata da oltre 3 s")
+	}
+	if abs(state.Pitch) > 20 || abs(state.Roll) > 20 {
+		findings = append(findings, fmt.Sprintf("assetto marcato pitch=%d roll=%d", state.Pitch, state.Roll))
+	}
+	analysis := "analisi OK"
+	if len(findings) > 0 {
+		analysis = "analisi: " + strings.Join(findings, "; ")
+	}
+	details := fmt.Sprintf("STEP %s · %s · %s", kind, status, time.Since(started).Round(100*time.Millisecond))
+	if state.Battery > 0 {
+		details += fmt.Sprintf(" · batteria %d%%", state.Battery)
+	}
+	details += fmt.Sprintf(" · quota %d cm · yaw %d° · %s", state.Height, state.Yaw, analysis)
+	c.log(details)
 }
 
 func (c *Controller) Sensor(name, argument string) program.Value {
@@ -234,7 +330,7 @@ func (c *Controller) Sensor(name, argument string) program.Value {
 	case "altitude":
 		height := c.device.Snapshot().Height
 		if height > 0 {
-			return float64(height) / c.config.CentimetersPerUnit
+			return float64(height)
 		}
 		return c.y
 	case "direction":
@@ -266,9 +362,7 @@ func (c *Controller) setSpeed(ctx context.Context, value float64) error {
 		c.log("Velocita impostata a zero: i movimenti saranno saltati.")
 		return nil
 	}
-	cmPerSecond := int(math.Round(value * c.config.CentimetersPerUnit))
-	cmPerSecond = max(10, min(100, cmPerSecond))
-	if err := c.send(ctx, fmt.Sprintf("speed %d", cmPerSecond)); err != nil {
+	if err := c.send(ctx, fmt.Sprintf("speed %d", c.speedCM(false))); err != nil {
 		return err
 	}
 	c.speedSent = true
@@ -300,16 +394,16 @@ func (c *Controller) wait(ctx context.Context, seconds float64) error {
 	return nil
 }
 
-func (c *Controller) directional(ctx context.Context, positive, negative string, units float64) error {
-	if units == 0 {
+func (c *Controller) directional(ctx context.Context, positive, negative string, centimeters float64) error {
+	if centimeters == 0 {
 		return nil
 	}
 	command := positive
-	if units < 0 {
+	if centimeters < 0 {
 		command = negative
-		units = -units
+		centimeters = -centimeters
 	}
-	total := int(math.Round(units * c.config.CentimetersPerUnit))
+	total := int(math.Round(centimeters))
 	parts, err := splitDistance(total)
 	if err != nil {
 		return fmt.Errorf("movimento %s: %w", command, err)
@@ -340,10 +434,11 @@ func splitDistance(total int) ([]int, error) {
 	return parts, nil
 }
 
-// vector accepts Tello body coordinates: forward, right, and up.
+// vector accepts Drone Commander body coordinates: forward, right, and up.
+// Tello's go/curve lateral axis is positive to the left, so right is negated
+// only when the command is encoded for the SDK.
 func (c *Controller) vector(ctx context.Context, forward, right, up float64, curve bool) error {
-	scale := c.config.CentimetersPerUnit
-	target := [3]int{int(math.Round(forward * scale)), int(math.Round(right * scale)), int(math.Round(up * scale))}
+	target := sdkVector(forward, right, up)
 	largest := max(abs(target[0]), max(abs(target[1]), abs(target[2])))
 	if largest == 0 {
 		return nil
@@ -373,7 +468,9 @@ func (c *Controller) vector(ctx context.Context, forward, right, up float64, cur
 }
 
 func (c *Controller) speedCM(curve bool) int {
-	speed := int(math.Round(c.speed * c.config.CentimetersPerUnit))
+	// Drone Commander exposes an abstract 0-10 speed, while the Tello SDK
+	// expects centimeters per second in the 10-100 range.
+	speed := int(math.Round(c.speed * 10))
 	speed = max(10, min(100, speed))
 	if curve {
 		speed = min(60, speed)
@@ -387,6 +484,7 @@ func (c *Controller) turn(ctx context.Context, degrees float64) error {
 	}
 	clockwise := degrees > 0
 	remaining := math.Abs(degrees)
+	executed := 0.0
 	for remaining >= 0.5 {
 		amount := min(360, int(math.Round(remaining)))
 		if amount < 1 {
@@ -399,9 +497,13 @@ func (c *Controller) turn(ctx context.Context, degrees float64) error {
 		if err := c.send(ctx, fmt.Sprintf("%s %d", command, amount)); err != nil {
 			return err
 		}
+		executed += float64(amount)
 		remaining -= float64(amount)
 	}
-	c.heading = normalize(c.heading + degrees)
+	if !clockwise {
+		executed = -executed
+	}
+	c.heading = normalize(c.heading + executed)
 	return nil
 }
 
@@ -411,7 +513,9 @@ func (c *Controller) goTo(ctx context.Context, x, y, z float64) error {
 	}
 	dx, dz := x-c.x, z-c.z
 	horizontal := math.Hypot(dx, dz)
-	if horizontal > 0 {
+	// Floating-point residue after a closed route must not rotate the drone in
+	// an arbitrary direction when the rounded displacement is actually zero.
+	if math.Round(horizontal) != 0 {
 		target := normalize(math.Atan2(dx, dz) * 180 / math.Pi)
 		if err := c.turn(ctx, shortest(c.heading, target)); err != nil {
 			return err
@@ -458,27 +562,52 @@ func (c *Controller) curveAbsolute(ctx context.Context, x, y, z, xd, yd, zd floa
 }
 
 func (c *Controller) curveCommand(ctx context.Context, via, target [3]float64) error {
-	scale := c.config.CentimetersPerUnit
-	a := [3]int{}
-	b := [3]int{}
+	viaCM := roundedVector(via)
+	targetCM := roundedVector(target)
+	a := sdkVector(via[0], via[1], via[2])
+	b := sdkVector(target[0], target[1], target[2])
 	for axis := 0; axis < 3; axis++ {
-		a[axis] = int(math.Round(via[axis] * scale))
-		b[axis] = int(math.Round(target[axis] * scale))
 		if abs(a[axis]) > 500 || abs(b[axis]) > 500 {
 			return errors.New("le coordinate di una curva devono essere tra -500 e 500 cm")
 		}
 	}
-	if max(abs(a[0]), max(abs(a[1]), abs(a[2]))) < 20 || max(abs(b[0]), max(abs(b[1]), abs(b[2]))) < 20 {
-		return errors.New("ogni punto della curva deve distare almeno 20 cm")
-	}
+	pointsReachMinimum := vectorMagnitude(a) >= 20 && vectorMagnitude(b) >= 20
 	radius, ok := circleRadius([3]float64{}, [3]float64{float64(a[0]), float64(a[1]), float64(a[2])}, [3]float64{float64(b[0]), float64(b[1]), float64(b[2])})
-	if !ok {
-		return errors.New("i punti della curva sono coincidenti o allineati")
+	if pointsReachMinimum && ok && radius >= 50 && radius <= 1000 {
+		return c.send(ctx, fmt.Sprintf("curve %d %d %d %d %d %d %d", a[0], a[1], a[2], b[0], b[1], b[2], c.speedCM(true)))
 	}
-	if radius < 50 || radius > 1000 {
-		return fmt.Errorf("raggio curva %.0f cm fuori dall'intervallo Tello 50-1000 cm", radius)
+
+	// The SDK rejects curves whose points are shorter than 20 cm, collinear,
+	// or outside its 50-1000 cm radius. Preserve the requested destination by
+	// approximating the path with two straight go commands when possible.
+	c.log("Curva non accettata nativamente dal Tello; uso segmenti lineari compatibili.")
+	second := [3]int{targetCM[0] - viaCM[0], targetCM[1] - viaCM[1], targetCM[2] - viaCM[2]}
+	if vectorMagnitude(viaCM) >= 20 && vectorMagnitude(second) >= 20 {
+		if err := c.vector(ctx, float64(viaCM[0]), float64(viaCM[1]), float64(viaCM[2]), false); err != nil {
+			return fmt.Errorf("primo segmento sostitutivo della curva: %w", err)
+		}
+		if err := c.vector(ctx, float64(second[0]), float64(second[1]), float64(second[2]), false); err != nil {
+			return fmt.Errorf("secondo segmento sostitutivo della curva: %w", err)
+		}
+		return nil
 	}
-	return c.send(ctx, fmt.Sprintf("curve %d %d %d %d %d %d %d", a[0], a[1], a[2], b[0], b[1], b[2], c.speedCM(true)))
+	if vectorMagnitude(targetCM) >= 20 {
+		c.log("I punti della curva sono troppo vicini; raggiungo direttamente la destinazione.")
+		return c.vector(ctx, float64(targetCM[0]), float64(targetCM[1]), float64(targetCM[2]), false)
+	}
+	return errors.New("curva inferiore a 20 cm: il Tello non puo eseguire neppure il percorso sostitutivo")
+}
+
+func roundedVector(vector [3]float64) [3]int {
+	return [3]int{int(math.Round(vector[0])), int(math.Round(vector[1])), int(math.Round(vector[2]))}
+}
+
+func sdkVector(forward, right, up float64) [3]int {
+	return roundedVector([3]float64{forward, -right, up})
+}
+
+func vectorMagnitude(vector [3]int) int {
+	return max(abs(vector[0]), max(abs(vector[1]), abs(vector[2])))
 }
 
 func circleRadius(a, b, c [3]float64) (float64, bool) {
@@ -503,8 +632,7 @@ func (c *Controller) advance(right, forward, up float64) {
 	c.y += up
 }
 
-func (c *Controller) validateAltitude(units float64) error {
-	centimeters := units * c.config.CentimetersPerUnit
+func (c *Controller) validateAltitude(centimeters float64) error {
 	if centimeters < minimumIndoorAltitudeCM {
 		return fmt.Errorf("quota indoor %.0f cm: il minimo di sicurezza e %.0f cm; usa Atterra per scendere", centimeters, minimumIndoorAltitudeCM)
 	}
