@@ -100,6 +100,30 @@ func TestSimulationWorkflowUsesCentimeters(t *testing.T) {
 	}
 }
 
+func TestCollisionCheckActivationIsLogged(t *testing.T) {
+	s := New(Options{})
+	defer s.Close()
+	if err := s.LoadProgram("empty.xml", []byte(`<xml><block type="start_block"></block></xml>`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Connect(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Start(RunConfig{CollisionCheck: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntilStopped(t, s)
+
+	var messages strings.Builder
+	for _, entry := range s.Snapshot().Logs {
+		messages.WriteString(entry.Message)
+		messages.WriteByte('\n')
+	}
+	if !strings.Contains(messages.String(), "Controllo collisioni attivato.") {
+		t.Fatalf("collision check activation was not logged:\n%s", messages.String())
+	}
+}
+
 func TestSubTwentyCentimeterMovementFails(t *testing.T) {
 	s := New(Options{})
 	defer s.Close()

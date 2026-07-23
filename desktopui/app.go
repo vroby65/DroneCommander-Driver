@@ -48,6 +48,7 @@ type UI struct {
 	simulation       *widget.Check
 	minimumBattery   *widget.Entry
 	autoLand         *widget.Check
+	collisionCheck   *widget.Check
 	loadButton       *widget.Button
 	editButton       *widget.Button
 	connectButton    *widget.Button
@@ -134,10 +135,11 @@ func (u *UI) build() {
 	}
 	u.autoLand = widget.NewCheck(u.t("auto_land"), nil)
 	u.autoLand.SetChecked(true)
+	u.collisionCheck = widget.NewCheck(u.t("collision_check"), nil)
 	unitHelp := widget.NewLabelWithStyle(u.t("unit_help"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	unitHelp.Wrapping = fyne.TextWrapWord
 	batteryRow := container.NewBorder(nil, nil, widget.NewLabel(u.t("minimum_battery")), nil, u.minimumBattery)
-	settings := container.NewVBox(unitHelp, container.NewGridWithColumns(2, batteryRow, u.autoLand))
+	settings := container.NewVBox(unitHelp, container.NewGridWithColumns(3, batteryRow, u.autoLand, u.collisionCheck))
 
 	u.runButton = widget.NewButtonWithIcon(u.t("start"), theme.MediaPlayIcon(), u.runProgram)
 	u.runButton.Importance = widget.HighImportance
@@ -205,10 +207,12 @@ func (u *UI) changeLanguage(name string) {
 	simulation := u.simulation.Checked
 	minimumBattery := u.minimumBattery.Text
 	autoLand := u.autoLand.Checked
+	collisionCheck := u.collisionCheck.Checked
 	u.build()
 	u.simulation.SetChecked(simulation)
 	u.minimumBattery.SetText(minimumBattery)
 	u.autoLand.SetChecked(autoLand)
+	u.collisionCheck.SetChecked(collisionCheck)
 	u.refresh(snapshot)
 	current := u.window.Canvas().Size()
 	u.window.Resize(fyne.NewSize(max(current.Width, u.preferredSize.Width), max(current.Height, u.preferredSize.Height)))
@@ -510,7 +514,11 @@ func (u *UI) runProgram() {
 		return
 	}
 	battery, _ := strconv.Atoi(u.minimumBattery.Text)
-	if err := u.session.Start(session.RunConfig{MinimumBattery: battery, AutoLand: u.autoLand.Checked}); err != nil {
+	if err := u.session.Start(session.RunConfig{
+		MinimumBattery: battery,
+		AutoLand:       u.autoLand.Checked,
+		CollisionCheck: u.collisionCheck.Checked,
+	}); err != nil {
 		u.showError(err)
 		return
 	}

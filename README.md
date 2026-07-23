@@ -25,6 +25,12 @@ The `Return to base` block returns to the initial X/Z coordinates while maintain
 
 The driver also rejects programmed flight altitudes below 20 cm. Use the `Land` block to descend below that threshold.
 
+## Curved Flight
+
+`Curve` uses coordinates relative to the current drone direction: X is right/left, Y is up/down, and Z is forward/backward. X/Y/Z identifies the intermediate point, while XD/YD/ZD is an offset from that intermediate point. `Absolute curve` instead uses two absolute program coordinates.
+
+The Tello firmware accepts a native `curve` command only when the circular arc through the current position and the two requested points has a radius between 50 and 1,000 cm. The driver calculates that radius before sending the command. If the curve is outside the firmware limits, it records the fallback in the flight log and preserves the destination with compatible straight `go` segments; such a path will look more angular than the simulator curve. Use a radius of at least 50 cm when a smooth native curve is required.
+
 ## Run
 
 Building requires Go 1.22, a C compiler, and the graphics libraries required by Fyne.
@@ -44,7 +50,9 @@ In the application:
 2. Choose an XML file saved by Drone Commander.
 3. Enable simulation mode, connect, and test the program.
 4. For real flight, connect the computer to the `TELLO-...` Wi-Fi network, disable simulation mode, and connect to the drone.
-5. Check the minimum battery threshold and start the program.
+5. Check the minimum battery threshold, choose whether to land at the end, optionally enable collision checking, and start the program.
+
+When collision checking is enabled, the driver reads the latest ToF distance before translational movements. A reading below 30 cm blocks the movement, activates the normal error recovery and safety landing, and records the intervention in the flight log. The option is disabled by default.
 
 The [examples/quadrato.xml](examples/quadrato.xml) file contains a 50 cm square indoor route that can be tested in simulation mode first.
 
@@ -94,6 +102,16 @@ make build-macos MACOS_SDK_PATH=/path/to/MacOSX.sdk
 
 Fyne uses CGO to access native graphics APIs, so setting `GOOS` alone is not enough. Each target needs the appropriate C compiler and headers or SDK. On macOS, use `make build` to build for the local architecture.
 
+Android packaging is experimental and uses `fyne-cross` with Docker to produce one sideload APK containing the supported mobile and emulator architectures:
+
+```sh
+go install github.com/fyne-io/fyne-cross@v1.6.2
+make build-android
+```
+
+Install the resulting APK with `adb install`. The Android device must be connected to the Tello Wi-Fi network before using real flight mode.
+This development APK is not a Google Play package; store distribution requires a persistent Android release keystore.
+
 ## Command Mapping
 
 | Drone Commander block | Tello command or behavior |
@@ -116,7 +134,9 @@ The driver maintains an estimated position to translate absolute movements. A st
 - Test every program in simulation mode.
 - Use propeller guards and completely clear the indoor flight area.
 - Enter altitudes and distances in centimeters, remembering the Tello SDK minimum of 20 cm per linear command.
+- Use a curve radius of at least 50 cm for native smooth Tello curves.
 - Keep automatic landing enabled at the end of the program.
+- When collision checking is enabled, translational movements are blocked if the latest ToF distance is below 30 cm; both activation and intervention are written to the flight log.
 - **Stop / hovering** cancels the program and sends `stop`.
 - **Land** cancels the program and sends `land`.
 - **Emergency motor stop** sends `emergency`: the drone falls immediately.

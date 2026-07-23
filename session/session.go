@@ -43,6 +43,7 @@ type Snapshot struct {
 type RunConfig struct {
 	MinimumBattery int
 	AutoLand       bool
+	CollisionCheck bool
 }
 
 type Session struct {
@@ -183,7 +184,15 @@ func (s *Session) Start(config RunConfig) error {
 	device := s.device
 	parsed := s.program
 	s.addLogLocked("Avvio programma " + s.programName + " (1 unita = 1 cm).")
-	controller := flight.NewController(device, flight.Config{MinimumBattery: config.MinimumBattery, KeyPressed: s.KeyPressed, Log: s.addLog})
+	if config.CollisionCheck {
+		s.addLogLocked("Controllo collisioni attivato.")
+	}
+	controller := flight.NewController(device, flight.Config{
+		MinimumBattery: config.MinimumBattery,
+		CollisionCheck: config.CollisionCheck,
+		KeyPressed:     s.KeyPressed,
+		Log:            s.addLog,
+	})
 	go s.execute(ctx, parsed, controller, device, config.AutoLand, runID)
 	return nil
 }

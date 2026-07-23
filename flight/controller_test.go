@@ -150,6 +150,28 @@ func TestTelemetryDistanceDoesNotBlockMovement(t *testing.T) {
 	}
 }
 
+func TestCollisionCheckBlocksMovementAndLogsIntervention(t *testing.T) {
+	device := &fakeCommander{state: tello.Telemetry{Height: 80, Values: map[string]float64{"tof": 5}}}
+	var logs []string
+	controller := NewController(device, Config{
+		CollisionCheck: true,
+		Log:            func(message string) { logs = append(logs, message) },
+	})
+	controller.flying = true
+	controller.y = 80
+
+	err := controller.Action(context.Background(), "walk", map[string]program.Value{"DIST": float64(30)})
+	if err == nil || !strings.Contains(err.Error(), "ostacolo rilevato a 5 cm") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(device.commands) != 0 {
+		t.Fatalf("movement was sent despite collision check: %#v", device.commands)
+	}
+	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "CONTROLLO COLLISIONI") {
+		t.Fatalf("collision intervention was not logged:\n%s", joined)
+	}
+}
+
 func TestReturnToBaseIgnoresClosedRouteFloatingPointResidue(t *testing.T) {
 	device := &fakeCommander{}
 	controller := NewController(device, Config{})

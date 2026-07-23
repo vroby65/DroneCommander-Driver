@@ -16,6 +16,7 @@ import (
 
 type Config struct {
 	MinimumBattery int
+	CollisionCheck bool
 	KeyPressed     func(string) bool
 	Log            func(string)
 }
@@ -26,7 +27,10 @@ type Result struct {
 	Heading float64
 }
 
-const minimumIndoorAltitudeCM = 20.0
+const (
+	minimumIndoorAltitudeCM    = 20.0
+	minimumCollisionDistanceCM = 30.0
+)
 
 // Controller is a program.Host backed by a Tello commander. Linear values read
 // from Drone Commander XML remain centimeters and pass unchanged to the SDK.
@@ -161,6 +165,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		distance := n("DIST")
 		if err := c.directional(ctx, "forward", "back", distance); err != nil {
 			return err
@@ -171,6 +178,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		distance := n("SLIDE")
 		if err := c.directional(ctx, "right", "left", distance); err != nil {
 			return err
@@ -180,6 +190,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 	case "walk_climbing":
 		if !c.flying || c.speed == 0 {
 			return nil
+		}
+		if err := c.checkCollision(); err != nil {
+			return err
 		}
 		forward, up := n("DIST"), n("CLIMB")
 		if err := c.validateAltitude(c.y + up); err != nil {
@@ -194,6 +207,9 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		right, up, forward := n("X"), n("Y"), n("Z")
 		if err := c.validateAltitude(c.y + up); err != nil {
 			return err
@@ -207,10 +223,16 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		return c.goTo(ctx, n("X"), n("Y"), n("Z"))
 	case "return_to_base":
 		if !c.flying || c.speed == 0 {
 			return nil
+		}
+		if err := c.checkCollision(); err != nil {
+			return err
 		}
 		// Indoors, returning at the current height is safer than reproducing the
 		// simulator's legacy altitude of 10 units (now exactly 10 cm).
@@ -219,10 +241,16 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if !c.flying || c.speed == 0 {
 			return nil
 		}
+		if err := c.checkCollision(); err != nil {
+			return err
+		}
 		return c.curveRelative(ctx, n("X"), n("Y"), n("Z"), n("XD"), n("YD"), n("ZD"))
 	case "curve_abs":
 		if !c.flying || c.speed == 0 {
 			return nil
+		}
+		if err := c.checkCollision(); err != nil {
+			return err
 		}
 		return c.curveAbsolute(ctx, n("X"), n("Y"), n("Z"), n("XD"), n("YD"), n("ZD"))
 	case "wait":
@@ -238,6 +266,19 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 	default:
 		return fmt.Errorf("azione drone sconosciuta: %s", kind)
 	}
+}
+
+func (c *Controller) checkCollision() error {
+	if !c.config.CollisionCheck {
+		return nil
+	}
+	distance, available := c.device.Snapshot().Values["tof"]
+	if !available || distance <= 0 || distance >= minimumCollisionDistanceCM {
+		return nil
+	}
+	err := fmt.Errorf("ostacolo rilevato a %.0f cm (distanza minima %.0f cm)", distance, minimumCollisionDistanceCM)
+	c.log("CONTROLLO COLLISIONI: " + err.Error() + "; movimento bloccato.")
+	return err
 }
 
 func (c *Controller) logStep(kind string, started time.Time, actionErr error) {

@@ -84,16 +84,32 @@ func TestLanguageCanChangeWithoutLosingFlightSettings(t *testing.T) {
 	ui.simulation.SetChecked(true)
 	ui.minimumBattery.SetText("35")
 	ui.autoLand.SetChecked(false)
+	ui.collisionCheck.SetChecked(true)
 
 	ui.changeLanguage("Deutsch")
 	if ui.languageID != "de" || ui.connection.Text != "● Nicht verbunden" {
 		t.Fatalf("language was not applied: id=%q connection=%q", ui.languageID, ui.connection.Text)
 	}
-	if !ui.simulation.Checked || ui.minimumBattery.Text != "35" || ui.autoLand.Checked {
+	if !ui.simulation.Checked || ui.minimumBattery.Text != "35" || ui.autoLand.Checked || !ui.collisionCheck.Checked {
 		t.Fatal("changing language lost flight settings")
 	}
 	if got := application.Preferences().String(languagePreference); got != "de" {
 		t.Fatalf("saved language = %q, want de", got)
+	}
+}
+
+func TestItalianFlightOptionLabels(t *testing.T) {
+	application := fyneTest.NewApp()
+	defer application.Quit()
+	window := application.NewWindow("test")
+	ui := &UI{app: application, window: window, session: session.New(session.Options{}), languageID: "it"}
+	ui.build()
+
+	if got := ui.autoLand.Text; got != "Atterra al termine" {
+		t.Fatalf("automatic landing label = %q", got)
+	}
+	if got := ui.collisionCheck.Text; got != "Controllo collisioni" {
+		t.Fatalf("collision check label = %q", got)
 	}
 }
 
