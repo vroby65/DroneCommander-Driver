@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,8 +20,10 @@ import (
 type Options struct {
 	CommandAddress string
 	StateAddress   string
+	VideoAddress   string
 	CommandTimeout time.Duration
 	LogPath        string
+	MediaDirectory string
 }
 
 type LogEntry struct {
@@ -29,21 +32,40 @@ type LogEntry struct {
 }
 
 type Snapshot struct {
-	Connected   bool
-	Connecting  bool
-	Simulated   bool
-	Running     bool
-	ProgramName string
-	Summary     *program.Summary
-	Telemetry   tello.Telemetry
-	LastError   string
-	Logs        []LogEntry
+	Connected       bool
+	Connecting      bool
+	Simulated       bool
+	Running         bool
+	ProgramName     string
+	Summary         *program.Summary
+	Telemetry       tello.Telemetry
+	LastError       string
+	Logs            []LogEntry
+	CameraEnabled   bool
+	CameraChanging  bool
+	CameraRequested bool
+	CameraFrame     image.Image
+	CameraFrameID   uint64
+	CameraError     string
+	MediaDirectory  string
 }
 
 type RunConfig struct {
 	MinimumBattery int
 	AutoLand       bool
 	CollisionCheck bool
+}
+
+type cameraStream interface {
+	Done() <-chan struct{}
+	Err() error
+	Close() error
+}
+
+type videoRecording interface {
+	AddFrame(image.Image)
+	Save() (string, error)
+	Cancel() error
 }
 
 type Session struct {
@@ -62,6 +84,20 @@ type Session struct {
 	logs        []LogEntry
 	logPath     string
 	keys        map[string]bool
+
+	camera           cameraStream
+	cameraFactory    func(string, func(image.Image)) (cameraStream, error)
+	cameraGeneration uint64
+	cameraEnabled    bool
+	cameraChanging   bool
+	cameraRequested  bool
+	cameraFrame      image.Image
+	cameraFrameID    uint64
+	cameraError      string
+
+	recording        videoRecording
+	recordingRunID   uint64
+	recordingFactory func(string, time.Time) (videoRecording, error)
 }
 
 func New(options Options) *Session {
@@ -71,10 +107,63 @@ func New(options Options) *Session {
 	if options.StateAddress == "" {
 		options.StateAddress = ":8890"
 	}
+	if options.VideoAddress == "" {
+		options.VideoAddress = ":11111"
+	}
 	if options.CommandTimeout <= 0 {
 		options.CommandTimeout = 8 * time.Second
 	}
-	return &Session{options: options, logPath: options.LogPath, keys: make(map[string]bool)}
+	if options.MediaDirectory == "" {
+		options.MediaDirectory = DefaultMediaDirectory()
+	}
+	return &Session{
+		options: options, logPath: options.LogPath, keys: make(map[string]bool),
+		cameraFactory: func(address string, onFrame func(image.Image)) (cameraStream, error) {
+			return tello.StartVideoReceiver(address, onFrame)
+		},
+		recordingFactory: newFFmpegRecording,
+	}
+}
+
+// DefaultMediaDirectory is where photos and videos are stored unless -media is
+// supplied on the command line.
+func DefaultMediaDirectory() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "Pictures", "DroneCommander")
+	}
+	if config, err := os.UserConfigDir(); err == nil && config != "" {
+		return filepath.Join(config, "drone-commander-driver", "media")
+	}
+	return ""
+}
+
+// SetMediaDirectory changes the destination used by the media blocks. It is
+// intentionally locked while a program is running so one recording cannot be
+// split across two locations.
+func (s *Session) SetMediaDirectory(directory string) error {
+	directory = strings.TrimSpace(directory)
+	if directory == "" {
+		return errors.New("seleziona una cartella per foto e registrazioni")
+	}
+	absolute, err := filepath.Abs(directory)
+	if err != nil {
+		return fmt.Errorf("percorso cartella multimediale: %w", err)
+	}
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return fmt.Errorf("cartella multimediale: %w", err)
+	}
+	if !info.IsDir() {
+		return errors.New("il percorso multimediale selezionato non è una cartella")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running || s.recording != nil {
+		return errors.New("scegli la cartella multimediale prima di avviare il programma")
+	}
+	s.options.MediaDirectory = filepath.Clean(absolute)
+	return nil
 }
 
 func (s *Session) LoadProgram(name string, data []byte) error {
@@ -106,9 +195,14 @@ func (s *Session) Connect(ctx context.Context, simulation bool) error {
 	}
 	s.connecting = true
 	old := s.device
+	oldSimulated := s.simulated
+	oldCamera := s.detachCameraLocked()
+	oldRecording := s.detachRecordingLocked()
 	s.device = nil
 	s.connected = false
 	s.mu.Unlock()
+	cancelDetachedRecording(oldRecording)
+	stopDetachedCamera(old, oldCamera, oldSimulated)
 	if old != nil {
 		_ = old.Close()
 	}
@@ -147,6 +241,9 @@ func (s *Session) Disconnect() error {
 	}
 	s.runID++
 	device := s.device
+	simulated := s.simulated
+	camera := s.detachCameraLocked()
+	recording := s.detachRecordingLocked()
 	s.device = nil
 	s.connected = false
 	s.connecting = false
@@ -154,10 +251,214 @@ func (s *Session) Disconnect() error {
 	s.cancel = nil
 	s.addLogLocked("Disconnesso.")
 	s.mu.Unlock()
+	cancelDetachedRecording(recording)
+	stopDetachedCamera(device, camera, simulated)
 	if device != nil {
 		return device.Close()
 	}
 	return nil
+}
+
+// SetCamera enables or disables the real Tello camera stream. The UDP receiver
+// is created before streamon so the initial H.264 parameter packets are not
+// lost.
+func (s *Session) SetCamera(ctx context.Context, enabled bool) error {
+	if enabled {
+		return s.enableCamera(ctx)
+	}
+	return s.disableCamera(ctx)
+}
+
+func (s *Session) enableCamera(ctx context.Context) error {
+	s.mu.Lock()
+	if !s.connected || s.device == nil {
+		s.mu.Unlock()
+		return errors.New("connetti prima il Tello")
+	}
+	if s.simulated {
+		s.mu.Unlock()
+		return errors.New("la telecamera non è disponibile in simulazione")
+	}
+	if s.running {
+		s.mu.Unlock()
+		return errors.New("attiva la telecamera prima di avviare il programma")
+	}
+	if s.cameraEnabled {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.cameraChanging {
+		s.mu.Unlock()
+		return errors.New("modifica della telecamera già in corso")
+	}
+	s.cameraGeneration++
+	generation := s.cameraGeneration
+	device := s.device
+	factory := s.cameraFactory
+	s.cameraChanging = true
+	s.cameraRequested = true
+	s.cameraError = ""
+	s.cameraFrame = nil
+	s.mu.Unlock()
+
+	receiver, err := factory(s.options.VideoAddress, func(frame image.Image) {
+		s.acceptCameraFrame(generation, frame)
+	})
+	if err == nil && receiver == nil {
+		err = errors.New("ricevitore video non inizializzato")
+	}
+	if err == nil {
+		_, err = device.Command(ctx, "streamon")
+	}
+	if err != nil {
+		if receiver != nil {
+			_ = receiver.Close()
+		}
+		s.mu.Lock()
+		if s.cameraGeneration == generation {
+			s.cameraChanging = false
+			s.cameraEnabled = false
+			s.cameraRequested = false
+			s.cameraError = err.Error()
+			s.addLogLocked("Attivazione telecamera fallita: " + err.Error())
+		}
+		s.mu.Unlock()
+		return err
+	}
+
+	s.mu.Lock()
+	if s.cameraGeneration != generation || !s.connected {
+		s.mu.Unlock()
+		_ = receiver.Close()
+		return context.Canceled
+	}
+	s.camera = receiver
+	s.cameraChanging = false
+	s.cameraEnabled = true
+	s.cameraError = ""
+	s.addLogLocked("Telecamera Tello attivata.")
+	s.mu.Unlock()
+	go s.monitorCamera(generation, receiver)
+	return nil
+}
+
+func (s *Session) disableCamera(ctx context.Context) error {
+	s.mu.Lock()
+	if s.cameraChanging && !s.cameraEnabled {
+		s.mu.Unlock()
+		return errors.New("modifica della telecamera già in corso")
+	}
+	if !s.cameraRequested && !s.cameraEnabled && s.camera == nil {
+		s.cameraRequested = false
+		s.cameraError = ""
+		s.cameraFrame = nil
+		s.mu.Unlock()
+		return nil
+	}
+	s.cameraGeneration++
+	generation := s.cameraGeneration
+	receiver := s.camera
+	recording := s.detachRecordingLocked()
+	device := s.device
+	sendStreamOff := s.connected && !s.simulated && device != nil
+	s.camera = nil
+	s.cameraEnabled = false
+	s.cameraChanging = true
+	s.cameraRequested = false
+	s.cameraFrame = nil
+	s.cameraError = ""
+	s.mu.Unlock()
+
+	cancelDetachedRecording(recording)
+	var commandErr error
+	if sendStreamOff {
+		_, commandErr = device.Command(ctx, "streamoff")
+	}
+	var closeErr error
+	if receiver != nil {
+		closeErr = receiver.Close()
+	}
+
+	s.mu.Lock()
+	if s.cameraGeneration == generation {
+		s.cameraChanging = false
+		if commandErr != nil {
+			s.cameraError = commandErr.Error()
+			s.addLogLocked("Disattivazione telecamera non confermata: " + commandErr.Error())
+		} else {
+			s.addLogLocked("Telecamera Tello disattivata.")
+		}
+	} else {
+		commandErr = nil
+	}
+	s.mu.Unlock()
+	if commandErr != nil {
+		return commandErr
+	}
+	return closeErr
+}
+
+func (s *Session) acceptCameraFrame(generation uint64, frame image.Image) {
+	if frame == nil {
+		return
+	}
+	s.mu.Lock()
+	var recording videoRecording
+	if s.cameraGeneration == generation && (s.cameraChanging || s.cameraEnabled) {
+		s.cameraFrame = frame
+		s.cameraFrameID++
+		recording = s.recording
+	}
+	s.mu.Unlock()
+	if recording != nil {
+		recording.AddFrame(frame)
+	}
+}
+
+func (s *Session) monitorCamera(generation uint64, receiver cameraStream) {
+	<-receiver.Done()
+	err := receiver.Err()
+	if err == nil {
+		err = errors.New("stream video terminato")
+	}
+	s.mu.Lock()
+	var recording videoRecording
+	if s.cameraGeneration == generation {
+		s.camera = nil
+		s.cameraEnabled = false
+		s.cameraChanging = false
+		s.cameraFrame = nil
+		s.cameraError = err.Error()
+		s.addLogLocked("Stream telecamera interrotto: " + err.Error())
+		recording = s.detachRecordingLocked()
+	}
+	s.mu.Unlock()
+	cancelDetachedRecording(recording)
+	_ = receiver.Close()
+}
+
+func (s *Session) detachCameraLocked() cameraStream {
+	s.cameraGeneration++
+	camera := s.camera
+	s.camera = nil
+	s.cameraEnabled = false
+	s.cameraChanging = false
+	s.cameraRequested = false
+	s.cameraFrame = nil
+	s.cameraError = ""
+	return camera
+}
+
+func stopDetachedCamera(device tello.Commander, camera cameraStream, simulated bool) {
+	if camera == nil {
+		return
+	}
+	if device != nil && !simulated {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = device.Command(ctx, "streamoff")
+		cancel()
+	}
+	_ = camera.Close()
 }
 
 func (s *Session) Start(config RunConfig) error {
@@ -174,6 +475,9 @@ func (s *Session) Start(config RunConfig) error {
 	}
 	if s.running {
 		return errors.New("un programma e gia in esecuzione")
+	}
+	if s.cameraChanging {
+		return errors.New("attendi il completamento della modifica della telecamera")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
@@ -192,6 +496,9 @@ func (s *Session) Start(config RunConfig) error {
 		CollisionCheck: config.CollisionCheck,
 		KeyPressed:     s.KeyPressed,
 		Log:            s.addLog,
+		TakePhoto:      s.takePhoto,
+		StartRecording: s.startRecording,
+		SaveRecording:  s.saveRecording,
 	})
 	go s.execute(ctx, parsed, controller, device, config.AutoLand, runID)
 	return nil
@@ -201,6 +508,7 @@ func (s *Session) execute(ctx context.Context, parsed *program.Program, controll
 	interpreter := program.Interpreter{Program: parsed, Host: controller, MaxSteps: 10000}
 	err := interpreter.Execute(ctx)
 	result := controller.Result()
+	s.discardRunRecording(runID)
 	if err == nil {
 		s.addLog("Programma completato.")
 		if autoLand && result.Flying {
@@ -326,7 +634,12 @@ func normalizeKey(key string) string {
 
 func (s *Session) Snapshot() Snapshot {
 	s.mu.Lock()
-	snapshot := Snapshot{Connected: s.connected, Connecting: s.connecting, Simulated: s.simulated, Running: s.running, ProgramName: s.programName, LastError: s.lastError, Logs: append([]LogEntry(nil), s.logs...)}
+	snapshot := Snapshot{
+		Connected: s.connected, Connecting: s.connecting, Simulated: s.simulated, Running: s.running,
+		ProgramName: s.programName, LastError: s.lastError, Logs: append([]LogEntry(nil), s.logs...),
+		CameraEnabled: s.cameraEnabled, CameraChanging: s.cameraChanging, CameraRequested: s.cameraRequested, CameraFrame: s.cameraFrame,
+		CameraFrameID: s.cameraFrameID, CameraError: s.cameraError, MediaDirectory: s.options.MediaDirectory,
+	}
 	if s.program != nil {
 		summary := s.program.Summary
 		snapshot.Summary = &summary

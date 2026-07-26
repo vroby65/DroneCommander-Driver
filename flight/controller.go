@@ -19,6 +19,9 @@ type Config struct {
 	CollisionCheck bool
 	KeyPressed     func(string) bool
 	Log            func(string)
+	TakePhoto      func(context.Context) (string, error)
+	StartRecording func(context.Context) error
+	SaveRecording  func(context.Context) (string, error)
 }
 
 type Result struct {
@@ -139,6 +142,41 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 			return err
 		}
 		c.flying, c.y = false, 0
+		return nil
+	case "take_photo":
+		if c.config.TakePhoto == nil {
+			c.log("Foto non disponibile: il gestore della telecamera non è configurato.")
+			return nil
+		}
+		path, photoErr := c.config.TakePhoto(ctx)
+		if photoErr != nil {
+			c.log("Foto non riuscita: " + photoErr.Error())
+			return nil
+		}
+		c.log("Foto salvata: " + path)
+		return nil
+	case "start_recording":
+		if c.config.StartRecording == nil {
+			c.log("Registrazione non disponibile: il gestore della telecamera non è configurato.")
+			return nil
+		}
+		if recordingErr := c.config.StartRecording(ctx); recordingErr != nil {
+			c.log("Registrazione non avviata: " + recordingErr.Error())
+			return nil
+		}
+		c.log("Registrazione video avviata.")
+		return nil
+	case "save_recording":
+		if c.config.SaveRecording == nil {
+			c.log("Salvataggio registrazione non disponibile: il gestore della telecamera non è configurato.")
+			return nil
+		}
+		path, recordingErr := c.config.SaveRecording(ctx)
+		if recordingErr != nil {
+			c.log("Registrazione non salvata: " + recordingErr.Error())
+			return nil
+		}
+		c.log("Registrazione video salvata: " + path)
 		return nil
 	case "set_altitude":
 		if !c.flying {

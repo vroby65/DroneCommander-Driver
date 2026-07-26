@@ -151,14 +151,21 @@ type Program struct {
 }
 
 type Summary struct {
-	Blocks   int      `json:"blocks"`
-	Commands int      `json:"commands"`
-	Warnings []string `json:"warnings,omitempty"`
+	Blocks        int      `json:"blocks"`
+	Commands      int      `json:"commands"`
+	MediaCommands int      `json:"mediaCommands,omitempty"`
+	Warnings      []string `json:"warnings,omitempty"`
+}
+
+var mediaActionTypes = map[string]bool{
+	"take_photo": true, "start_recording": true, "save_recording": true,
 }
 
 var actionTypes = map[string]bool{
-	"take_off": true, "land": true, "return_to_base": true,
-	"set_altitude": true, "change_altitude": true, "set_angle": true,
+	"take_off": true, "land": true,
+	"take_photo": true, "start_recording": true, "save_recording": true,
+	"return_to_base": true,
+	"set_altitude":   true, "change_altitude": true, "set_angle": true,
 	"change_angle": true, "slide": true, "walk": true,
 	"walk_climbing": true, "go_to": true, "move_by": true,
 	"curve_abs": true, "curve": true, "wait": true, "smoke": true,
@@ -221,6 +228,9 @@ func Parse(data []byte) (*Program, error) {
 		p.Summary.Blocks++
 		if actionTypes[block.Type] {
 			p.Summary.Commands++
+			if mediaActionTypes[block.Type] {
+				p.Summary.MediaCommands++
+			}
 		} else if !statementTypes[block.Type] && !expressionTypes[block.Type] {
 			unsupported = append(unsupported, block.Type)
 		}

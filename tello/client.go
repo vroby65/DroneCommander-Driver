@@ -37,9 +37,10 @@ type Commander interface {
 }
 
 type Client struct {
-	commandAddress string
-	stateAddress   string
-	timeout        time.Duration
+	commandAddress      string
+	commandLocalAddress string
+	stateAddress        string
+	timeout             time.Duration
 
 	commandConn  *net.UDPConn
 	stateConn    *net.UDPConn
@@ -63,7 +64,10 @@ func NewClient(commandAddress, stateAddress string, timeout time.Duration) *Clie
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
-	return &Client{commandAddress: commandAddress, stateAddress: stateAddress, timeout: timeout, speedCM: 10, closed: make(chan struct{})}
+	return &Client{
+		commandAddress: commandAddress, commandLocalAddress: ":9000",
+		stateAddress: stateAddress, timeout: timeout, speedCM: 10, closed: make(chan struct{}),
+	}
 }
 
 // Connect opens command and state sockets and enters SDK mode.
@@ -72,7 +76,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("indirizzo Tello non valido: %w", err)
 	}
-	commandConn, err := net.DialUDP("udp", nil, remote)
+	commandLocal, err := net.ResolveUDPAddr("udp", c.commandLocalAddress)
+	if err != nil {
+		return fmt.Errorf("indirizzo UDP locale comandi non valido: %w", err)
+	}
+	if commandLocal.IP == nil || commandLocal.IP.IsUnspecified() {
+		commandLocal.IP = localIPOnRemoteSubnet(remote.IP)
+	}
+	commandConn, err := net.DialUDP("udp", commandLocal, remote)
 	if err != nil {
 		return fmt.Errorf("connessione UDP al Tello: %w", err)
 	}
@@ -93,6 +104,33 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("impossibile attivare la modalita SDK (verifica la rete Wi-Fi TELLO): %w", err)
 	}
 	_, _ = c.Command(ctx, "battery?")
+	go c.keepAlive()
+	return nil
+}
+
+// localIPOnRemoteSubnet keeps command traffic on the Tello Wi-Fi when the
+// computer is connected to another network at the same time. Without an
+// explicit source address, a transient route change can send 192.168.10.1
+// through the Internet-facing adapter.
+func localIPOnRemoteSubnet(remote net.IP) net.IP {
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	return matchingLocalIP(remote, addresses)
+}
+
+func matchingLocalIP(remote net.IP, addresses []net.Addr) net.IP {
+	for _, address := range addresses {
+		network, ok := address.(*net.IPNet)
+		if !ok || !network.Contains(remote) {
+			continue
+		}
+		if remote.To4() != nil && network.IP.To4() == nil {
+			continue
+		}
+		return append(net.IP(nil), network.IP...)
+	}
 	return nil
 }
 
@@ -103,24 +141,67 @@ func (c *Client) Command(ctx context.Context, command string) (string, error) {
 	if c.commandConn == nil {
 		return "", errors.New("Tello non connesso")
 	}
-	if c.pendingDrain.Swap(false) {
-		c.drainResponses(200 * time.Millisecond)
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
-	started := time.Now()
 	commandTimeout := c.timeoutFor(command)
+	attempts := 1
+	if retryableCommand(command) {
+		attempts = 3
+		commandTimeout = min(commandTimeout, 1500*time.Millisecond)
+	}
+	var lastResponse string
+	var lastError error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return lastResponse, err
+		}
+		if c.pendingDrain.Swap(false) {
+			c.drainResponses(100 * time.Millisecond)
+		}
+		response, err, retry := c.commandOnce(ctx, command, commandTimeout)
+		if err == nil {
+			if attempt > 1 {
+				// Multiple idempotent sends can produce duplicate late
+				// acknowledgements. Drain them before a different command uses
+				// the same response socket.
+				c.pendingDrain.Store(true)
+			}
+			return response, nil
+		}
+		lastResponse, lastError = response, err
+		if !retry || attempt == attempts {
+			break
+		}
+		timer := time.NewTimer(150 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return lastResponse, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if attempts > 1 {
+		return lastResponse, fmt.Errorf("%q non confermato dopo %d tentativi: %w", command, attempts, lastError)
+	}
+	return lastResponse, lastError
+}
+
+func (c *Client) commandOnce(ctx context.Context, command string, commandTimeout time.Duration) (string, error, bool) {
+	started := time.Now()
 	deadline := started.Add(commandTimeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
 	if err := c.commandConn.SetDeadline(deadline); err != nil {
-		return "", err
+		return "", err, true
 	}
 	c.writeMu.Lock()
 	_, err := c.commandConn.Write([]byte(command))
 	c.writeMu.Unlock()
 	if err != nil {
-		return "", fmt.Errorf("invio %q: %w", command, err)
+		return "", fmt.Errorf("invio %q: %w", command, err), true
 	}
 
 	buffer := make([]byte, 1024)
@@ -143,21 +224,70 @@ func (c *Client) Command(ctx context.Context, command string) (string, error) {
 		case <-time.After(100 * time.Millisecond):
 		}
 		c.pendingDrain.Store(true)
-		return "", ctx.Err()
+		return "", ctx.Err(), false
 	case result := <-read:
 		if result.err != nil {
 			c.pendingDrain.Store(true)
 			if timeout, ok := result.err.(net.Error); ok && timeout.Timeout() {
-				return "", fmt.Errorf("timeout Tello dopo %s per %q (il movimento potrebbe essere ancora in corso): %w", time.Since(started).Round(100*time.Millisecond), command, result.err)
+				if retryableCommand(command) {
+					return "", fmt.Errorf("timeout Tello dopo %s per %q: %w", time.Since(started).Round(100*time.Millisecond), command, result.err), true
+				}
+				return "", fmt.Errorf(
+					"timeout Tello dopo %s per %q (il movimento potrebbe essere ancora in corso): %w",
+					time.Since(started).Round(100*time.Millisecond), command, result.err,
+				), true
 			}
-			return "", fmt.Errorf("risposta a %q: %w", command, result.err)
+			return "", fmt.Errorf("risposta a %q: %w", command, result.err), true
 		}
 		response := strings.TrimSpace(string(buffer[:result.n]))
 		if strings.HasPrefix(strings.ToLower(response), "error") {
-			return response, fmt.Errorf("il Tello ha rifiutato %q: %s", command, response)
+			return response, fmt.Errorf("il Tello ha rifiutato %q: %s", command, response), false
+		}
+		if !responseMatchesCommand(command, response) {
+			c.pendingDrain.Store(true)
+			return response, fmt.Errorf("risposta Tello inattesa per %q: %q", command, response), retryableCommand(command)
 		}
 		c.recordResponse(command, response)
-		return response, nil
+		return response, nil, false
+	}
+}
+
+func retryableCommand(command string) bool {
+	fields := strings.Fields(strings.ToLower(command))
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "command", "streamon", "streamoff":
+		return true
+	default:
+		return strings.HasSuffix(fields[0], "?")
+	}
+}
+
+func responseMatchesCommand(command, response string) bool {
+	fields := strings.Fields(strings.ToLower(command))
+	if len(fields) == 0 || response == "" {
+		return false
+	}
+	if strings.HasSuffix(fields[0], "?") {
+		return !strings.EqualFold(response, "ok")
+	}
+	return strings.EqualFold(response, "ok")
+}
+
+func (c *Client) keepAlive() {
+	ticker := time.NewTicker(8 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _ = c.Command(ctx, "battery?")
+			cancel()
+		}
 	}
 }
 

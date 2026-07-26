@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
@@ -44,6 +46,11 @@ type UI struct {
 	lastError        *widget.Label
 	logs             *widget.RichText
 	logScroll        *container.Scroll
+	cameraToggle     *widget.Check
+	cameraImage      *canvas.Image
+	cameraStatus     *widget.Label
+	mediaDirectory   *widget.Label
+	mediaButton      *widget.Button
 	language         *widget.Select
 	simulation       *widget.Check
 	minimumBattery   *widget.Entry
@@ -59,6 +66,9 @@ type UI struct {
 	emergencyButton  *widget.Button
 	preferredSize    fyne.Size
 	lastLogText      string
+	lastCameraFrame  uint64
+	syncingCamera    bool
+	changingCameraUI bool
 	stopRefresh      chan struct{}
 }
 
@@ -85,6 +95,7 @@ func (u *UI) build() {
 		u.languageID = normalizeLanguage(fyneLang.SystemLocale().LanguageString())
 	}
 	u.lastLogText = "\x00"
+	u.lastCameraFrame = 0
 	u.connection = widget.NewLabelWithStyle(u.t("not_connected"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	u.simulation = widget.NewCheck(u.t("simulation"), nil)
 	u.connectButton = widget.NewButtonWithIcon(u.t("connect"), theme.RadioButtonCheckedIcon(), u.connect)
@@ -139,7 +150,13 @@ func (u *UI) build() {
 	unitHelp := widget.NewLabelWithStyle(u.t("unit_help"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	unitHelp.Wrapping = fyne.TextWrapWord
 	batteryRow := container.NewBorder(nil, nil, widget.NewLabel(u.t("minimum_battery")), nil, u.minimumBattery)
-	settings := container.NewVBox(unitHelp, container.NewGridWithColumns(3, batteryRow, u.autoLand, u.collisionCheck))
+	u.mediaDirectory = widget.NewLabel(u.session.Snapshot().MediaDirectory)
+	u.mediaDirectory.Truncation = fyne.TextTruncateEllipsis
+	u.mediaButton = widget.NewButtonWithIcon(u.t("choose_media_folder"), theme.FolderOpenIcon(), func() {
+		u.chooseMediaDirectory(nil)
+	})
+	mediaRow := container.NewBorder(nil, nil, widget.NewLabel(u.t("media_folder")), u.mediaButton, u.mediaDirectory)
+	settings := container.NewVBox(unitHelp, container.NewGridWithColumns(3, batteryRow, u.autoLand, u.collisionCheck), mediaRow)
 
 	u.runButton = widget.NewButtonWithIcon(u.t("start"), theme.MediaPlayIcon(), u.runProgram)
 	u.runButton.Importance = widget.HighImportance
@@ -163,10 +180,32 @@ func (u *UI) build() {
 	logHeader := container.NewBorder(nil, nil, widget.NewLabel(u.t("log_help")), clearLogButton)
 	logBody := container.NewBorder(logHeader, nil, nil, nil, u.logScroll)
 	logCard := widget.NewCard(u.t("flight_log"), "", logBody)
+
+	u.cameraToggle = widget.NewCheck(u.t("camera_toggle"), u.toggleCamera)
+	u.cameraImage = canvas.NewImageFromImage(nil)
+	u.cameraImage.FillMode = canvas.ImageFillContain
+	u.cameraImage.ScaleMode = canvas.ImageScaleSmooth
+	u.cameraStatus = widget.NewLabel(u.t("camera_unavailable"))
+	u.cameraStatus.Alignment = fyne.TextAlignLeading
+	u.cameraStatus.Wrapping = fyne.TextWrapWord
+	cameraBackground := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
+	cameraViewport := container.NewGridWrap(
+		fyne.NewSize(320, 240),
+		container.NewStack(cameraBackground, u.cameraImage),
+	)
+	cameraTitle := widget.NewLabelWithStyle(u.t("camera"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	cameraCard := widget.NewCard("", "", container.NewVBox(
+		cameraViewport,
+		cameraTitle,
+		u.cameraToggle,
+		u.cameraStatus,
+	))
+
 	topContent := container.NewVBox(topRow, programCard, flightCard, u.lastError)
 	// The log is the expanding centre object: it reaches the lower edge of the
-	// window instead of leaving unused space below a vertically packed VBox.
-	frame := container.NewBorder(topContent, nil, nil, nil, logCard)
+	// window; the fixed 4:3 camera panel remains in the lower-right corner.
+	lowerContent := container.NewBorder(nil, nil, nil, cameraCard, logCard)
+	frame := container.NewBorder(topContent, nil, nil, nil, lowerContent)
 	u.window.SetContent(frame)
 	contentSize := frame.MinSize()
 	u.preferredSize = fyne.NewSize(
@@ -504,6 +543,25 @@ func (u *UI) disconnect() {
 		fyne.Do(func() { u.refresh(u.session.Snapshot()) })
 	}()
 }
+func (u *UI) toggleCamera(enabled bool) {
+	if u.syncingCamera {
+		return
+	}
+	u.changingCameraUI = true
+	u.cameraToggle.Disable()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := u.session.SetCamera(ctx, enabled)
+		fyne.Do(func() {
+			if err != nil {
+				u.showError(err)
+			}
+			u.changingCameraUI = false
+			u.refresh(u.session.Snapshot())
+		})
+	}()
+}
 func (u *UI) runProgram() {
 	if err := u.minimumBattery.Validate(); err != nil {
 		u.showError(err)
@@ -513,6 +571,19 @@ func (u *UI) runProgram() {
 		u.showError(err)
 		return
 	}
+	snapshot := u.session.Snapshot()
+	if shouldChooseMediaDirectory(snapshot) {
+		u.chooseMediaDirectory(u.startProgram)
+		return
+	}
+	u.startProgram()
+}
+
+func shouldChooseMediaDirectory(snapshot session.Snapshot) bool {
+	return snapshot.Summary != nil && snapshot.Summary.MediaCommands > 0 && !snapshot.Simulated
+}
+
+func (u *UI) startProgram() {
 	battery, _ := strconv.Atoi(u.minimumBattery.Text)
 	if err := u.session.Start(session.RunConfig{
 		MinimumBattery: battery,
@@ -523,6 +594,50 @@ func (u *UI) runProgram() {
 		return
 	}
 	u.refresh(u.session.Snapshot())
+}
+
+func (u *UI) chooseMediaDirectory(selected func()) {
+	folderDialog := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
+		if err != nil {
+			u.showError(err)
+			return
+		}
+		if uri == nil {
+			return
+		}
+		if uri.Scheme() != "file" {
+			u.showError(errors.New(u.t("local_media_folder")))
+			return
+		}
+		if err := u.session.SetMediaDirectory(uri.Path()); err != nil {
+			u.showError(err)
+			return
+		}
+		u.refresh(u.session.Snapshot())
+		if selected != nil {
+			selected()
+		}
+	}, u.window)
+	folderDialog.SetTitleText(u.t("media_folder_prompt"))
+	folderDialog.SetConfirmText(u.t("select_folder"))
+	_, cancel := confirmLabels(u.languageID)
+	folderDialog.SetDismissText(cancel)
+	folderDialog.Resize(fyne.NewSize(760, 520))
+
+	directory := u.session.Snapshot().MediaDirectory
+	for directory != "" {
+		location, err := storage.ListerForURI(storage.NewFileURI(directory))
+		if err == nil {
+			folderDialog.SetLocation(location)
+			break
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+		directory = parent
+	}
+	folderDialog.Show()
 }
 func (u *UI) safety(command string) {
 	go func() {
@@ -573,7 +688,7 @@ func (u *UI) bindKeyboard() {
 	canvas.SetOnKeyUp(func(event *fyne.KeyEvent) { u.session.SetKey(string(event.Name), false) })
 }
 func (u *UI) refreshLoop() {
-	ticker := time.NewTicker(400 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -630,11 +745,14 @@ func (u *UI) refresh(snapshot session.Snapshot) {
 		u.logs.Refresh()
 		u.logScroll.ScrollToBottom()
 	}
+	u.refreshCamera(snapshot)
+	u.mediaDirectory.SetText(snapshot.MediaDirectory)
 	setEnabled(u.loadButton, !snapshot.Running && !snapshot.Connecting)
 	setEnabled(u.editButton, u.programURI != nil)
 	setEnabled(u.connectButton, !snapshot.Connected && !snapshot.Running && !snapshot.Connecting)
 	setEnabled(u.disconnectButton, snapshot.Connected && !snapshot.Running)
-	setEnabled(u.runButton, snapshot.Connected && snapshot.Summary != nil && !snapshot.Running)
+	setEnabled(u.runButton, snapshot.Connected && snapshot.Summary != nil && !snapshot.Running && !snapshot.CameraChanging)
+	setEnabled(u.mediaButton, !snapshot.Running && !snapshot.Connecting)
 	setEnabled(u.stopButton, snapshot.Connected && snapshot.Running)
 	setEnabled(u.landButton, snapshot.Connected)
 	setEnabled(u.emergencyButton, snapshot.Connected)
@@ -642,6 +760,58 @@ func (u *UI) refresh(snapshot session.Snapshot) {
 		u.simulation.Disable()
 	} else {
 		u.simulation.Enable()
+	}
+}
+
+func (u *UI) refreshCamera(snapshot session.Snapshot) {
+	if !u.changingCameraUI {
+		u.syncingCamera = true
+		u.cameraToggle.SetChecked(snapshot.CameraRequested)
+		u.syncingCamera = false
+	}
+
+	if snapshot.CameraEnabled && snapshot.CameraFrame != nil {
+		if snapshot.CameraFrameID != u.lastCameraFrame {
+			u.cameraImage.Image = snapshot.CameraFrame
+			u.cameraImage.Refresh()
+			u.lastCameraFrame = snapshot.CameraFrameID
+		}
+		u.cameraStatus.SetText(u.t("camera_live"))
+	} else {
+		if u.cameraImage.Image != nil {
+			u.cameraImage.Image = nil
+			u.cameraImage.Refresh()
+		}
+		u.lastCameraFrame = 0
+		u.cameraStatus.SetText(u.cameraStatusText(snapshot))
+	}
+	u.cameraStatus.Show()
+
+	cameraCanChange := snapshot.Connected && !snapshot.Simulated && !snapshot.Running && !snapshot.Connecting &&
+		!snapshot.CameraChanging && !u.changingCameraUI
+	if cameraCanChange {
+		u.cameraToggle.Enable()
+	} else {
+		u.cameraToggle.Disable()
+	}
+}
+
+func (u *UI) cameraStatusText(snapshot session.Snapshot) string {
+	switch {
+	case snapshot.CameraChanging && snapshot.CameraRequested:
+		return u.t("camera_starting")
+	case snapshot.CameraChanging:
+		return u.t("camera_stopping")
+	case snapshot.CameraError != "":
+		return snapshot.CameraError
+	case snapshot.CameraEnabled:
+		return u.t("camera_waiting")
+	case snapshot.Simulated:
+		return u.t("camera_simulation")
+	case !snapshot.Connected:
+		return u.t("camera_unavailable")
+	default:
+		return u.t("camera_off")
 	}
 }
 

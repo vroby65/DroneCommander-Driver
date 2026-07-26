@@ -2,8 +2,8 @@ BINARY := drone-commander-driver
 DIST := dist
 LDFLAGS := -s -w
 TAGS := migrated_fynedo
-VERSION ?= 1.1.0
-BUILD_NUMBER ?= 2
+VERSION ?= 1.2.0
+BUILD_NUMBER ?= 3
 FYNE_CROSS ?= $(shell go env GOPATH)/bin/fyne-cross
 ANDROID_APP_ID ?= org.dronecommander.tellodriver
 DARWIN_IMAGE ?= fyneio/fyne-cross-images:darwin
@@ -23,7 +23,7 @@ build-linux:
 
 build-windows:
 	mkdir -p $(DIST)
-	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS) -H=windowsgui" -o $(DIST)/$(BINARY)-windows-amd64.exe .
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS) -H=windowsgui" -o $(DIST)/$(BINARY)-windows-amd64.exe .
 
 build-macos:
 	@test -n "$(MACOS_SDK_PATH)" || (echo "Imposta MACOS_SDK_PATH alla directory MacOSX.sdk" && exit 1)

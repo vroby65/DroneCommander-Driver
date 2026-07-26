@@ -2,8 +2,8 @@
 Icon = "Icon.png"
 Name = "Drone Commander Tello Driver"
 ID = "org.dronecommander.tello-driver"
-Version = "1.1.0"
-Build = 2
+Version = "1.2.0"
+Build = 3
 
 [Migrations]
 fyneDo = true

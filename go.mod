@@ -2,7 +2,10 @@ module github.com/vroby65/DroneCommander-Driver
 
 go 1.22.0
 
-require fyne.io/fyne/v2 v2.7.4
+require (
+	fyne.io/fyne/v2 v2.7.4
+	github.com/Azunyan1111/openh264-go v0.2.0
+)
 
 require (
 	fyne.io/systray v1.12.2 // indirect

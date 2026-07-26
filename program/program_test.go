@@ -62,6 +62,35 @@ func TestParseRejectsUnsupportedBlock(t *testing.T) {
 	}
 }
 
+func TestCameraBlocksParseAndExecute(t *testing.T) {
+	xml := `<xml><block type="start_block"><next>
+	  <block type="take_photo"><next>
+	  <block type="start_recording"><next>
+	  <block type="save_recording"></block>
+	  </next></block></next></block>
+	</next></block></xml>`
+	parsed, err := Parse([]byte(xml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Summary.Commands != 3 {
+		t.Fatalf("commands = %d, want 3", parsed.Summary.Commands)
+	}
+	if parsed.Summary.MediaCommands != 3 {
+		t.Fatalf("media commands = %d, want 3", parsed.Summary.MediaCommands)
+	}
+	host := &recordingHost{}
+	if err := (&Interpreter{Program: parsed, Host: host}).Execute(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"take_photo", "start_recording", "save_recording"}
+	for index, action := range host.actions {
+		if action.kind != want[index] {
+			t.Fatalf("action %d = %s, want %s", index, action.kind, want[index])
+		}
+	}
+}
+
 func TestInterpreterVariablesAndCondition(t *testing.T) {
 	xml := `<xml><block type="start_block"><next>
     <block type="variables_set"><field name="VAR" id="v">n</field><value name="VALUE"><block type="math_number"><field name="NUM">3</field></block></value><next>
@@ -106,7 +135,7 @@ func TestEveryBlockInDroneCommanderToolboxIsRecognized(t *testing.T) {
 		"text", "text_join", "text_append", "text_length", "text_isEmpty", "text_indexOf", "text_charAt", "text_getSubstring", "text_changeCase", "text_trim", "text_print",
 		"lists_create_with", "lists_repeat", "lists_length", "lists_isEmpty", "lists_indexOf", "lists_getIndex", "lists_setIndex", "lists_getSublist", "lists_split", "lists_sort",
 		"sensor_keypressed", "sensor_x", "sensor_z", "sensor_altitude", "sensor_direction", "sensor_speed",
-		"take_off", "land", "return_to_base", "set_altitude", "change_altitude", "set_angle", "change_angle", "slide", "walk", "walk_climbing", "go_to", "move_by", "curve_abs", "curve", "wait", "smoke", "set_speed", "end_block",
+		"take_off", "land", "take_photo", "start_recording", "save_recording", "return_to_base", "set_altitude", "change_altitude", "set_angle", "change_angle", "slide", "walk", "walk_climbing", "go_to", "move_by", "curve_abs", "curve", "wait", "smoke", "set_speed", "end_block",
 	}
 	for _, blockType := range types {
 		xml := `<xml><block type="start_block"></block><block type="` + blockType + `"></block></xml>`
