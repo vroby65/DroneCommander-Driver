@@ -58,6 +58,53 @@ func TestControllerRejectsSubMinimumMovement(t *testing.T) {
 	}
 }
 
+func TestControllerExecutesCameraCallbacksWithoutDroneCommands(t *testing.T) {
+	device := &fakeCommander{}
+	var calls []string
+	controller := NewController(device, Config{
+		TakePhoto: func(context.Context) (string, error) {
+			calls = append(calls, "photo")
+			return "/media/photo.png", nil
+		},
+		StartRecording: func(context.Context) error {
+			calls = append(calls, "start")
+			return nil
+		},
+		SaveRecording: func(context.Context) (string, error) {
+			calls = append(calls, "save")
+			return "/media/video.mp4", nil
+		},
+	})
+	for _, kind := range []string{"take_photo", "start_recording", "save_recording"} {
+		if err := controller.Action(context.Background(), kind, nil); err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+	}
+	if got := strings.Join(calls, "|"); got != "photo|start|save" {
+		t.Fatalf("camera callback order = %q", got)
+	}
+	if len(device.commands) != 0 {
+		t.Fatalf("camera blocks sent Tello SDK commands: %#v", device.commands)
+	}
+}
+
+func TestCameraCallbackFailureIsLoggedAndDoesNotAbortFlight(t *testing.T) {
+	device := &fakeCommander{}
+	var logs []string
+	controller := NewController(device, Config{
+		TakePhoto: func(context.Context) (string, error) {
+			return "", context.DeadlineExceeded
+		},
+		Log: func(message string) { logs = append(logs, message) },
+	})
+	if err := controller.Action(context.Background(), "take_photo", nil); err != nil {
+		t.Fatalf("camera failure aborted the program: %v", err)
+	}
+	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "Foto non riuscita") {
+		t.Fatalf("camera failure was not logged:\n%s", joined)
+	}
+}
+
 func TestVectorCoordinates(t *testing.T) {
 	device := &fakeCommander{}
 	controller := NewController(device, Config{})

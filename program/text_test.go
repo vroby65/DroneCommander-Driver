@@ -64,6 +64,9 @@ func TestTextProgramRoundTripExample(t *testing.T) {
 
 func TestTextProgramSupportsLatestFlightCommands(t *testing.T) {
 	source := `TAKE_OFF
+TAKE_PHOTO
+START_RECORDING
+SAVE_RECORDING
 SET_ALTITUDE altitude=80
 CHANGE_ALTITUDE altitude=20
 SET_ANGLE angle=180
@@ -89,8 +92,8 @@ LAND
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Summary.Commands != 17 {
-		t.Fatalf("command count = %d, want 17\n%s", parsed.Summary.Commands, data)
+	if parsed.Summary.Commands != 20 {
+		t.Fatalf("command count = %d, want 20\n%s", parsed.Summary.Commands, data)
 	}
 	text, err := ToTextProgram(data)
 	if err != nil {
@@ -123,6 +126,9 @@ func TestTextProgramReferenceListsParameters(t *testing.T) {
 	for _, signature := range []string{
 		"REPEAT times=<number> {",
 		"WALK distance=<number>",
+		"TAKE_PHOTO",
+		"START_RECORDING",
+		"SAVE_RECORDING",
 		"CURVE x1=<number> y1=<number> z1=<number> x2=<number> y2=<number> z2=<number>",
 		"SMOKE enabled=<true|false>",
 	} {

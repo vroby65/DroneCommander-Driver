@@ -26,6 +26,32 @@ func TestPreferredWindowContainsInterface(t *testing.T) {
 	if ui.preferredSize.Width < 1100 || ui.preferredSize.Height < 760 {
 		t.Fatalf("preferred window = %.0fx%.0f, below 1100x760", ui.preferredSize.Width, ui.preferredSize.Height)
 	}
+	if ui.cameraToggle == nil || ui.cameraImage == nil || ui.cameraStatus == nil {
+		t.Fatal("lower-right camera panel was not built")
+	}
+	if ui.mediaDirectory == nil || ui.mediaButton == nil {
+		t.Fatal("media directory selector was not built")
+	}
+	if ui.cameraImage.Size().Width < 320 || ui.cameraImage.Size().Height < 240 {
+		t.Fatalf("camera viewport = %.0fx%.0f, want at least 320x240", ui.cameraImage.Size().Width, ui.cameraImage.Size().Height)
+	}
+	ui.refresh(ui.session.Snapshot())
+	if !ui.cameraToggle.Disabled() {
+		t.Fatal("camera toggle must stay disabled until a real Tello is connected")
+	}
+}
+
+func TestRealMediaProgramRequiresDirectoryChoiceBeforeRun(t *testing.T) {
+	mediaSummary := &program.Summary{MediaCommands: 1}
+	if !shouldChooseMediaDirectory(session.Snapshot{Summary: mediaSummary}) {
+		t.Fatal("real program with media commands did not require a destination")
+	}
+	if shouldChooseMediaDirectory(session.Snapshot{Summary: mediaSummary, Simulated: true}) {
+		t.Fatal("simulation should not ask for a real camera media destination")
+	}
+	if shouldChooseMediaDirectory(session.Snapshot{Summary: &program.Summary{}}) {
+		t.Fatal("program without media commands requested a destination")
+	}
 }
 
 func TestReadableLogSegmentsShowEventCategories(t *testing.T) {

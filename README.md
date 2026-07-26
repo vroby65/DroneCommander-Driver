@@ -11,6 +11,20 @@ Drone Commander provides an [online editor and simulator](https://vroby65.github
 3. Open the file in the driver and test it again in simulation mode.
 4. Connect the computer to the `TELLO-...` Wi-Fi network and run the program on the drone.
 
+## Downloads
+
+Prebuilt packages are available from the [latest GitHub release](https://github.com/vroby65/DroneCommander-Driver/releases/latest):
+
+| Platform | Package |
+|---|---|
+| Linux AMD64 | `DroneCommander-Driver-v1.2.0-linux-amd64.tar.gz` |
+| Windows AMD64 | `DroneCommander-Driver-v1.2.0-windows-amd64.zip` |
+| macOS Intel | `DroneCommander-Driver-v1.2.0-macos-amd64.tar.gz` |
+| macOS Apple Silicon | `DroneCommander-Driver-v1.2.0-macos-arm64.tar.gz` |
+| Android | `DroneCommander-Driver-v1.2.0-android-universal.apk` |
+
+Use the supplied `SHA256SUMS` file to verify downloads. Desktop archives contain the executable, this README, and the MIT License. The macOS binaries are currently unsigned and not notarized; Gatekeeper may require manual approval on first launch. The Android APK is development-signed for direct sideloading and is not a Google Play package.
+
 ## Indoor Units
 
 The conversion is fixed:
@@ -38,7 +52,7 @@ Building requires Go 1.22, a C compiler, and the graphics libraries required by 
 On Debian/Ubuntu:
 
 ```sh
-sudo apt-get install gcc libgl1-mesa-dev xorg-dev libxkbcommon-dev
+sudo apt-get install gcc g++ ffmpeg libgl1-mesa-dev xorg-dev libxkbcommon-dev
 git clone https://github.com/vroby65/DroneCommander-Driver.git
 cd DroneCommander-Driver
 go run .
@@ -50,9 +64,24 @@ In the application:
 2. Choose an XML file saved by Drone Commander.
 3. Enable simulation mode, connect, and test the program.
 4. For real flight, connect the computer to the `TELLO-...` Wi-Fi network, disable simulation mode, and connect to the drone.
-5. Check the minimum battery threshold, choose whether to land at the end, optionally enable collision checking, and start the program.
+5. To see the live drone view, enable **Camera** below the lower-right preview. The control is available only with a real Tello connection.
+6. Check the minimum battery threshold, choose whether to land at the end, optionally enable collision checking, and start the program.
 
 When collision checking is enabled, the driver reads the latest ToF distance before translational movements. A reading below 30 cm blocks the movement, activates the normal error recovery and safety landing, and records the intervention in the flight log. The option is disabled by default.
+
+## Camera, photos, and recordings
+
+The camera receiver listens on UDP port 11111, sends the Tello SDK `streamon` / `streamoff` commands, and decodes the H.264 feed inside the application. FFmpeg is used when installed because it recovers more reliably from incomplete UDP frames produced by real-world Wi-Fi packet loss; an embedded OpenH264 decoder is retained as a fallback. The preview may remain on during a program run; its checkbox is locked until the run finishes to keep camera commands from interfering with a movement command.
+
+The Drone Commander blocks **Take a photo**, **Start recording**, and **Save recording** use the manually enabled live camera. Photos are saved as timestamped PNG files. Recordings are encoded at 30 fps and saved as timestamped MP4 files when **Save recording** runs. An unfinished recording is discarded when the program stops or ends. Before every real run containing media blocks, the driver asks which folder should receive its photos and recordings; the current destination is also visible and changeable in the flight settings. `~/Pictures/DroneCommander` is only the initial suggestion and can be changed with `-media`.
+
+Camera preview and photo/video capture are currently supported by the desktop builds. The Android build can run flight programs, but its H.264 camera decoder is not yet available.
+
+FFmpeg is required to create MP4 recordings and is strongly recommended for the most resilient live preview. Make sure the `ffmpeg` executable is available in `PATH`:
+
+- Debian/Ubuntu: `sudo apt-get install ffmpeg`
+- macOS with Homebrew: `brew install ffmpeg`
+- Windows: install an FFmpeg build and add its `bin` directory to `PATH`
 
 The [examples/quadrato.xml](examples/quadrato.xml) file contains a 50 cm square indoor route that can be tested in simulation mode first.
 
@@ -109,7 +138,7 @@ go install github.com/fyne-io/fyne-cross@v1.6.2
 make build-android
 ```
 
-Install the resulting APK with `adb install`. The Android device must be connected to the Tello Wi-Fi network before using real flight mode.
+Install the resulting APK with `adb install`. The Android device must be connected to the Tello Wi-Fi network before using real flight mode. Camera preview and media capture are not currently available on Android.
 This development APK is not a Google Play package; store distribution requires a persistent Android release keystore.
 
 ## Command Mapping
@@ -117,6 +146,8 @@ This development APK is not a Google Play package; store distribution requires a
 | Drone Commander block | Tello command or behavior |
 |---|---|
 | Take off / Land | `takeoff` / `land` |
+| Take a photo | saves the latest decoded camera frame as a timestamped PNG |
+| Start / Save recording | records decoded camera frames at 30 fps and saves a timestamped MP4 through FFmpeg |
 | Walk | `forward` or `back`, distance in cm |
 | Slide | `right` or `left`, distance in cm |
 | Set/change altitude | `up` or `down`, distance in cm |
@@ -149,7 +180,9 @@ Every flight action also writes a `STEP` analysis with duration and current tele
 ```text
 -tello 192.168.10.1:8889     UDP command address
 -state :8890                 local telemetry bind address
--log PATH                   persistent flight log (default: user config directory)
+-video :11111                local camera video bind address
+-log PATH                    persistent flight log (default: user config directory)
+-media PATH                  initially suggested photo/recording directory
 ```
 
 ## Project Structure
@@ -158,7 +191,7 @@ Every flight action also writes a `STEP` analysis with duration and current tele
 - `session/` — application state, connection, and execution;
 - `program/` — Blockly XML parser and interpreter;
 - `flight/` — conversion from blocks to Tello commands;
-- `tello/` — UDP protocol, telemetry, and offline simulator.
+- `tello/` — UDP protocol, telemetry, H.264 camera receiver, and offline simulator.
 
 ## Tests
 

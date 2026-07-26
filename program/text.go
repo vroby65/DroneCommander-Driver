@@ -27,6 +27,9 @@ type textCommand struct {
 var textCommands = []textCommand{
 	{Keyword: "TAKE_OFF", BlockType: "take_off"},
 	{Keyword: "LAND", BlockType: "land"},
+	{Keyword: "TAKE_PHOTO", BlockType: "take_photo"},
+	{Keyword: "START_RECORDING", BlockType: "start_recording"},
+	{Keyword: "SAVE_RECORDING", BlockType: "save_recording"},
 	{Keyword: "RETURN_TO_BASE", BlockType: "return_to_base"},
 	{Keyword: "SET_ALTITUDE", BlockType: "set_altitude", Params: []textParameter{{Name: "altitude", XMLName: "ALTITUDE"}}},
 	{Keyword: "CHANGE_ALTITUDE", BlockType: "change_altitude", Params: []textParameter{{Name: "altitude", XMLName: "ALTITUDE"}}},
