@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/vroby65/DroneCommander-Driver/program"
@@ -33,7 +34,29 @@ type Result struct {
 const (
 	minimumIndoorAltitudeCM    = 20.0
 	minimumCollisionDistanceCM = 30.0
+	collisionMonitorInterval   = 20 * time.Millisecond
+	maximumCollisionSampleGap  = 500 * time.Millisecond
+	impactAccelerationDeltaMG  = 1200.0
+	impactAccelerationTotalMG  = 2500.0
+	impactTiltDegrees          = 45
+	tiltedImpactDeltaMG        = 600.0
 )
+
+// Impact describes the telemetry sample that triggered an in-flight collision
+// intervention. Tello reports accelerations in thousandths of one g.
+type Impact struct {
+	AccelerationDeltaMG float64
+	AccelerationTotalMG float64
+	Pitch               int
+	Roll                int
+}
+
+func (i Impact) Error() string {
+	return fmt.Sprintf(
+		"urto rilevato (variazione accelerazione %.1f g, accelerazione totale %.1f g, pitch %d°, roll %d°)",
+		i.AccelerationDeltaMG/1000, i.AccelerationTotalMG/1000, i.Pitch, i.Roll,
+	)
+}
 
 // Controller is a program.Host backed by a Tello commander. Linear values read
 // from Drone Commander XML remain centimeters and pass unchanged to the SDK.
@@ -46,6 +69,7 @@ type Controller struct {
 	speedSent   bool
 	flying      bool
 	lastBattery int
+	impactArmed atomic.Bool
 }
 
 const defaultSpeed = 3.0
@@ -108,6 +132,7 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		if c.flying {
 			return nil
 		}
+		c.impactArmed.Store(false)
 		if err := c.EnsureBattery(ctx); err != nil {
 			return err
 		}
@@ -133,11 +158,18 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 		// A controller is recreated for every run, but the real drone keeps its
 		// orientation after landing. Start absolute angles from the live yaw.
 		c.heading = normalize(float64(state.Yaw))
+		// The takeoff acknowledgement arrives once the maneuver is complete.
+		// Arm impact detection now so takeoff acceleration cannot be mistaken
+		// for a collision.
+		c.impactArmed.Store(true)
 		return nil
 	case "land":
 		if !c.flying {
 			return nil
 		}
+		// Normal landing can generate a sharp acceleration when the feet touch
+		// the floor; it is not an in-flight collision.
+		c.impactArmed.Store(false)
 		if err := c.send(ctx, "land"); err != nil {
 			return err
 		}
@@ -304,6 +336,89 @@ func (c *Controller) Action(ctx context.Context, kind string, arguments map[stri
 	default:
 		return fmt.Errorf("azione drone sconosciuta: %s", kind)
 	}
+}
+
+// MonitorImpact waits for an acceleration discontinuity while the controller
+// is airborne. It compares distinct, fresh 10 Hz Tello telemetry packets and
+// returns at the first likely impact or when the context is cancelled.
+func (c *Controller) MonitorImpact(ctx context.Context) (Impact, bool) {
+	if !c.config.CollisionCheck {
+		return Impact{}, false
+	}
+	ticker := time.NewTicker(collisionMonitorInterval)
+	defer ticker.Stop()
+
+	var previous [3]float64
+	var previousAt time.Time
+	seeded := false
+	for {
+		select {
+		case <-ctx.Done():
+			return Impact{}, false
+		case <-ticker.C:
+		}
+
+		if !c.impactArmed.Load() {
+			seeded = false
+			previousAt = time.Time{}
+			continue
+		}
+		state := c.device.Snapshot()
+		if state.UpdatedAt.IsZero() || time.Since(state.UpdatedAt) > maximumCollisionSampleGap || state.UpdatedAt.Equal(previousAt) {
+			continue
+		}
+		acceleration, available := telemetryAcceleration(state)
+		if !available {
+			seeded = false
+			previousAt = state.UpdatedAt
+			continue
+		}
+		if !seeded || state.UpdatedAt.Sub(previousAt) <= 0 || state.UpdatedAt.Sub(previousAt) > maximumCollisionSampleGap {
+			previous = acceleration
+			previousAt = state.UpdatedAt
+			seeded = true
+			continue
+		}
+
+		delta := vectorLength(
+			acceleration[0]-previous[0],
+			acceleration[1]-previous[1],
+			acceleration[2]-previous[2],
+		)
+		total := vectorLength(acceleration[0], acceleration[1], acceleration[2])
+		previous = acceleration
+		previousAt = state.UpdatedAt
+
+		tilted := abs(state.Pitch) >= impactTiltDegrees || abs(state.Roll) >= impactTiltDegrees
+		if delta < impactAccelerationDeltaMG && total < impactAccelerationTotalMG && (!tilted || delta < tiltedImpactDeltaMG) {
+			continue
+		}
+		if !c.impactArmed.CompareAndSwap(true, false) {
+			continue
+		}
+		return Impact{
+			AccelerationDeltaMG: delta,
+			AccelerationTotalMG: total,
+			Pitch:               state.Pitch,
+			Roll:                state.Roll,
+		}, true
+	}
+}
+
+func telemetryAcceleration(state tello.Telemetry) ([3]float64, bool) {
+	var acceleration [3]float64
+	for index, name := range [...]string{"agx", "agy", "agz"} {
+		value, available := state.Values[name]
+		if !available {
+			return [3]float64{}, false
+		}
+		acceleration[index] = value
+	}
+	return acceleration, true
+}
+
+func vectorLength(x, y, z float64) float64 {
+	return math.Sqrt(x*x + y*y + z*z)
 }
 
 func (c *Controller) checkCollision() error {

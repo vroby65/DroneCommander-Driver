@@ -68,6 +68,99 @@ type changingBatteryCommander struct {
 	state     tello.Telemetry
 }
 
+type impactCommander struct {
+	mu       sync.Mutex
+	commands []string
+	state    tello.Telemetry
+}
+
+type blockingImpactCommander struct {
+	*impactCommander
+	movementStarted chan struct{}
+	startOnce       sync.Once
+}
+
+func newImpactCommander() *impactCommander {
+	return &impactCommander{
+		state: tello.Telemetry{
+			Battery:   75,
+			Values:    map[string]float64{"agx": 0, "agy": 0, "agz": -1000},
+			UpdatedAt: time.Now(),
+		},
+	}
+}
+
+func newBlockingImpactCommander() *blockingImpactCommander {
+	return &blockingImpactCommander{
+		impactCommander: newImpactCommander(),
+		movementStarted: make(chan struct{}),
+	}
+}
+
+func (c *blockingImpactCommander) Command(ctx context.Context, command string) (string, error) {
+	if command != "forward 30" {
+		return c.impactCommander.Command(ctx, command)
+	}
+	c.mu.Lock()
+	c.commands = append(c.commands, "confirmed:"+command)
+	c.mu.Unlock()
+	c.startOnce.Do(func() { close(c.movementStarted) })
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (c *impactCommander) Connect(context.Context) error { return nil }
+func (c *impactCommander) Command(_ context.Context, command string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commands = append(c.commands, "confirmed:"+command)
+	switch command {
+	case "battery?":
+		return "75", nil
+	case "takeoff":
+		c.state.Height = 80
+		c.state.UpdatedAt = time.Now()
+	case "land":
+		c.state.Height = 0
+		c.state.UpdatedAt = time.Now()
+	}
+	return "ok", nil
+}
+func (c *impactCommander) Immediate(command string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commands = append(c.commands, "immediate:"+command)
+	if command == "land" {
+		c.state.Height = 0
+		c.state.UpdatedAt = time.Now()
+	}
+	return nil
+}
+func (c *impactCommander) Snapshot() tello.Telemetry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	state := c.state
+	state.Values = make(map[string]float64, len(c.state.Values))
+	for name, value := range c.state.Values {
+		state.Values[name] = value
+	}
+	return state
+}
+func (c *impactCommander) Close() error { return nil }
+func (c *impactCommander) publishImpact() {
+	c.mu.Lock()
+	c.state.Values = map[string]float64{"agx": 1600, "agy": 0, "agz": -1000}
+	c.state.Pitch = 7
+	c.state.Roll = -4
+	c.state.UpdatedAt = time.Now()
+	c.mu.Unlock()
+}
+func (c *impactCommander) commandLog() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.commands, "|")
+}
+
 func (c *changingBatteryCommander) Connect(context.Context) error { return nil }
 func (c *changingBatteryCommander) Command(_ context.Context, command string) (string, error) {
 	c.mu.Lock()
@@ -165,6 +258,47 @@ func TestCollisionCheckActivationIsLogged(t *testing.T) {
 	}
 	if !strings.Contains(messages.String(), "Controllo collisioni attivato.") {
 		t.Fatalf("collision check activation was not logged:\n%s", messages.String())
+	}
+}
+
+func TestImpactImmediatelyLandsAndCancelsProgram(t *testing.T) {
+	s := New(Options{})
+	defer s.Close()
+	xml := `<xml><block type="start_block"><next><block type="take_off"><next><block type="walk"><value name="DIST"><block type="math_number"><field name="NUM">30</field></block></value></block></next></block></next></block></xml>`
+	if err := s.LoadProgram("impact.xml", []byte(xml)); err != nil {
+		t.Fatal(err)
+	}
+	device := newBlockingImpactCommander()
+	s.mu.Lock()
+	s.device = device
+	s.connected = true
+	s.mu.Unlock()
+
+	if err := s.Start(RunConfig{CollisionCheck: true}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-device.movementStarted:
+	case <-time.After(time.Second):
+		t.Fatal("movement command was not sent")
+	}
+	// Allow one telemetry packet to become the airborne acceleration baseline.
+	time.Sleep(60 * time.Millisecond)
+	device.publishImpact()
+	waitUntilStopped(t, s)
+
+	snapshot := s.Snapshot()
+	if !strings.Contains(snapshot.LastError, "urto rilevato") {
+		t.Fatalf("collision error = %q", snapshot.LastError)
+	}
+	commands := device.commandLog()
+	immediate := strings.Index(commands, "immediate:land")
+	confirmed := strings.Index(commands, "confirmed:land")
+	if immediate < 0 || confirmed < 0 || immediate > confirmed {
+		t.Fatalf("landing sequence = %q, want immediate land before confirmed land", commands)
+	}
+	if snapshot.Telemetry.Height != 0 {
+		t.Fatalf("height after collision landing = %d cm", snapshot.Telemetry.Height)
 	}
 }
 

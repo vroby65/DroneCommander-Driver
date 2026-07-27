@@ -56,6 +56,11 @@ type RunConfig struct {
 	CollisionCheck bool
 }
 
+type impactIntervention struct {
+	impact       flight.Impact
+	immediateErr error
+}
+
 type cameraStream interface {
 	Done() <-chan struct{}
 	Err() error
@@ -490,6 +495,7 @@ func (s *Session) Start(config RunConfig) error {
 	s.addLogLocked("Avvio programma " + s.programName + " (1 unita = 1 cm).")
 	if config.CollisionCheck {
 		s.addLogLocked("Controllo collisioni attivato.")
+		s.addLogLocked("Monitor urti in volo attivo: un impatto avvia immediatamente l'atterraggio.")
 	}
 	controller := flight.NewController(device, flight.Config{
 		MinimumBattery: config.MinimumBattery,
@@ -505,11 +511,43 @@ func (s *Session) Start(config RunConfig) error {
 }
 
 func (s *Session) execute(ctx context.Context, parsed *program.Program, controller *flight.Controller, device tello.Commander, autoLand bool, runID uint64) {
+	programCtx, cancelProgram := context.WithCancel(ctx)
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	impactDone := make(chan *impactIntervention, 1)
+	go func() {
+		impact, detected := controller.MonitorImpact(monitorCtx)
+		if !detected {
+			impactDone <- nil
+			return
+		}
+		// Immediate bypasses the serialized command queue, so land is sent even
+		// while a long movement command is still waiting for its response.
+		immediateErr := device.Immediate("land")
+		cancelProgram()
+		impactDone <- &impactIntervention{impact: impact, immediateErr: immediateErr}
+	}()
+
 	interpreter := program.Interpreter{Program: parsed, Host: controller, MaxSteps: 10000}
-	err := interpreter.Execute(ctx)
+	err := interpreter.Execute(programCtx)
+	stopMonitor()
+	intervention := <-impactDone
+	cancelProgram()
 	result := controller.Result()
 	s.discardRunRecording(runID)
-	if err == nil {
+	if intervention != nil {
+		err = intervention.impact
+		s.addLog("COLLISIONE/URTO: " + intervention.impact.Error() + ".")
+		if intervention.immediateErr != nil {
+			s.addLog("Invio immediato di land non riuscito: " + intervention.immediateErr.Error())
+			err = fmt.Errorf("%w; invio immediato di land: %v", err, intervention.immediateErr)
+		} else {
+			s.addLog("Comando land immediato inviato; programma interrotto.")
+		}
+		if landErr := s.confirmedLand(device, false); landErr != nil {
+			s.addLog("Atterraggio dopo l'urto non confermato: " + landErr.Error())
+			err = fmt.Errorf("%w; conferma atterraggio dopo l'urto: %v", err, landErr)
+		}
+	} else if err == nil {
 		s.addLog("Programma completato.")
 		if autoLand && result.Flying {
 			s.addLog("Atterraggio automatico finale.")

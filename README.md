@@ -67,7 +67,7 @@ In the application:
 5. To see the live drone view, enable **Camera** below the lower-right preview. The control is available only with a real Tello connection.
 6. Check the minimum battery threshold, choose whether to land at the end, optionally enable collision checking, and start the program.
 
-When collision checking is enabled, the driver reads the latest ToF distance before translational movements. A reading below 30 cm blocks the movement, activates the normal error recovery and safety landing, and records the intervention in the flight log. The option is disabled by default.
+When collision checking is enabled, the driver reads the latest ToF distance before translational movements. A reading below 30 cm blocks the movement, activates the normal error recovery and safety landing, and records the intervention in the flight log. While the program is airborne, the same option also monitors the 10 Hz accelerometer telemetry for a likely impact. A sharp acceleration change sends `land` immediately without waiting for the active movement command, cancels the program, and then sends a second confirmed `land`. Takeoff and normal landing are excluded to avoid treating them as impacts. The option is disabled by default.
 
 ## Camera, photos, and recordings
 
@@ -167,7 +167,7 @@ The driver maintains an estimated position to translate absolute movements. A st
 - Enter altitudes and distances in centimeters, remembering the Tello SDK minimum of 20 cm per linear command.
 - Use a curve radius of at least 50 cm for native smooth Tello curves.
 - Keep automatic landing enabled at the end of the program.
-- When collision checking is enabled, translational movements are blocked if the latest ToF distance is below 30 cm; both activation and intervention are written to the flight log.
+- When collision checking is enabled, translational movements are blocked if the latest ToF distance is below 30 cm. An acceleration spike during flight immediately cancels the program and starts a controlled landing; all interventions are written to the flight log.
 - **Stop / hovering** cancels the program and sends `stop`.
 - **Land** cancels the program and sends `land`.
 - **Emergency motor stop** sends `emergency`: the drone falls immediately.
