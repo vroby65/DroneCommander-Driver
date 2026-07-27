@@ -17,11 +17,11 @@ Prebuilt packages are available from the [latest GitHub release](https://github.
 
 | Platform | Package |
 |---|---|
-| Linux AMD64 | `DroneCommander-Driver-v1.2.0-linux-amd64.tar.gz` |
-| Windows AMD64 | `DroneCommander-Driver-v1.2.0-windows-amd64.zip` |
-| macOS Intel | `DroneCommander-Driver-v1.2.0-macos-amd64.tar.gz` |
-| macOS Apple Silicon | `DroneCommander-Driver-v1.2.0-macos-arm64.tar.gz` |
-| Android | `DroneCommander-Driver-v1.2.0-android-universal.apk` |
+| Linux AMD64 | `DroneCommander-Driver-v1.3.0-linux-amd64.tar.gz` |
+| Windows AMD64 | `DroneCommander-Driver-v1.3.0-windows-amd64.zip` |
+| macOS Intel | `DroneCommander-Driver-v1.3.0-macos-amd64.tar.gz` |
+| macOS Apple Silicon | `DroneCommander-Driver-v1.3.0-macos-arm64.tar.gz` |
+| Android | `DroneCommander-Driver-v1.3.0-android-universal.apk` |
 
 Use the supplied `SHA256SUMS` file to verify downloads. Desktop archives contain the executable, this README, and the MIT License. The macOS binaries are currently unsigned and not notarized; Gatekeeper may require manual approval on first launch. The Android APK is development-signed for direct sideloading and is not a Google Play package.
 

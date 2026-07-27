@@ -6,11 +6,11 @@ on:
       source_ref:
         description: Git tag or commit to build
         required: true
-        default: v1.2.0
+        default: v1.3.0
       release_version:
         description: Version used in archive names
         required: true
-        default: v1.2.0
+        default: v1.3.0
 
 permissions:
   contents: read
