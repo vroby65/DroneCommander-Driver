@@ -9,7 +9,7 @@ ANDROID_APP_ID ?= org.dronecommander.tellodriver
 DARWIN_IMAGE ?= fyneio/fyne-cross-images:darwin
 MACOS_SDK_PATH ?=
 
-.PHONY: build test build-linux build-windows build-macos build-android build-all clean
+.PHONY: build test build-linux build-windows check-windows-runtime build-macos build-android build-all clean
 
 build:
 	CGO_ENABLED=1 go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) .
@@ -23,7 +23,15 @@ build-linux:
 
 build-windows:
 	mkdir -p $(DIST)
-	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS) -H=windowsgui" -o $(DIST)/$(BINARY)-windows-amd64.exe .
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS) -H=windowsgui -linkmode=external -extldflags=-static" -o $(DIST)/$(BINARY)-windows-amd64.exe .
+	$(MAKE) check-windows-runtime
+
+check-windows-runtime:
+	@imports="$$(x86_64-w64-mingw32-objdump -p $(DIST)/$(BINARY)-windows-amd64.exe)" || exit 1; \
+	if printf '%s\n' "$$imports" | grep -Eq 'DLL Name: (libgcc_s_seh-1|libstdc\+\+-6|libwinpthread-1)\.dll'; then \
+		echo "Windows executable depends on MinGW runtime DLLs"; \
+		exit 1; \
+	fi
 
 build-macos:
 	@test -n "$(MACOS_SDK_PATH)" || (echo "Imposta MACOS_SDK_PATH alla directory MacOSX.sdk" && exit 1)
