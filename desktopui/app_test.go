@@ -32,12 +32,32 @@ func TestPreferredWindowContainsInterface(t *testing.T) {
 	if ui.mediaDirectory == nil || ui.mediaButton == nil {
 		t.Fatal("media directory selector was not built")
 	}
+	if got := ui.mediaDirectory.Text; got != ui.session.Snapshot().MediaDirectory {
+		t.Fatalf("media directory field = %q, want %q", got, ui.session.Snapshot().MediaDirectory)
+	}
 	if ui.cameraImage.Size().Width < 320 || ui.cameraImage.Size().Height < 240 {
 		t.Fatalf("camera viewport = %.0fx%.0f, want at least 320x240", ui.cameraImage.Size().Width, ui.cameraImage.Size().Height)
 	}
 	ui.refresh(ui.session.Snapshot())
 	if !ui.cameraToggle.Disabled() {
 		t.Fatal("camera toggle must stay disabled until a real Tello is connected")
+	}
+}
+
+func TestMediaDirectoryFieldUpdatesSession(t *testing.T) {
+	application := fyneTest.NewApp()
+	defer application.Quit()
+	window := application.NewWindow("test")
+	ui := &UI{app: application, window: window, session: session.New(session.Options{}), languageID: "it"}
+	ui.build()
+
+	directory := t.TempDir()
+	ui.mediaDirectory.OnSubmitted(directory)
+	if got := ui.session.Snapshot().MediaDirectory; got != directory {
+		t.Fatalf("media directory = %q, want %q", got, directory)
+	}
+	if got := ui.mediaDirectory.Text; got != directory {
+		t.Fatalf("media directory field = %q, want %q", got, directory)
 	}
 }
 

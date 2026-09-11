@@ -49,7 +49,7 @@ type UI struct {
 	cameraToggle     *widget.Check
 	cameraImage      *canvas.Image
 	cameraStatus     *widget.Label
-	mediaDirectory   *widget.Label
+	mediaDirectory   *widget.Entry
 	mediaButton      *widget.Button
 	language         *widget.Select
 	simulation       *widget.Check
@@ -150,13 +150,7 @@ func (u *UI) build() {
 	unitHelp := widget.NewLabelWithStyle(u.t("unit_help"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	unitHelp.Wrapping = fyne.TextWrapWord
 	batteryRow := container.NewBorder(nil, nil, widget.NewLabel(u.t("minimum_battery")), nil, u.minimumBattery)
-	u.mediaDirectory = widget.NewLabel(u.session.Snapshot().MediaDirectory)
-	u.mediaDirectory.Truncation = fyne.TextTruncateEllipsis
-	u.mediaButton = widget.NewButtonWithIcon(u.t("choose_media_folder"), theme.FolderOpenIcon(), func() {
-		u.chooseMediaDirectory(nil)
-	})
-	mediaRow := container.NewBorder(nil, nil, widget.NewLabel(u.t("media_folder")), u.mediaButton, u.mediaDirectory)
-	settings := container.NewVBox(unitHelp, container.NewGridWithColumns(3, batteryRow, u.autoLand, u.collisionCheck), mediaRow)
+	settings := container.NewVBox(unitHelp, container.NewGridWithColumns(3, batteryRow, u.autoLand, u.collisionCheck))
 
 	u.runButton = widget.NewButtonWithIcon(u.t("start"), theme.MediaPlayIcon(), u.runProgram)
 	u.runButton.Importance = widget.HighImportance
@@ -188,6 +182,13 @@ func (u *UI) build() {
 	u.cameraStatus = widget.NewLabel(u.t("camera_unavailable"))
 	u.cameraStatus.Alignment = fyne.TextAlignLeading
 	u.cameraStatus.Wrapping = fyne.TextWrapWord
+	u.mediaDirectory = widget.NewEntry()
+	u.mediaDirectory.SetText(u.session.Snapshot().MediaDirectory)
+	u.mediaDirectory.OnSubmitted = u.submitMediaDirectory
+	u.mediaButton = widget.NewButtonWithIcon(u.t("choose_media_folder"), theme.FolderOpenIcon(), func() {
+		u.chooseMediaDirectory(nil)
+	})
+	mediaRow := container.NewBorder(nil, nil, nil, u.mediaButton, u.mediaDirectory)
 	cameraBackground := canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
 	cameraViewport := container.NewGridWrap(
 		fyne.NewSize(320, 240),
@@ -199,6 +200,8 @@ func (u *UI) build() {
 		cameraTitle,
 		u.cameraToggle,
 		u.cameraStatus,
+		widget.NewLabel(u.t("media_folder")),
+		mediaRow,
 	))
 
 	topContent := container.NewVBox(topRow, programCard, flightCard, u.lastError)
@@ -583,6 +586,17 @@ func shouldChooseMediaDirectory(snapshot session.Snapshot) bool {
 	return snapshot.Summary != nil && snapshot.Summary.MediaCommands > 0 && !snapshot.Simulated
 }
 
+func (u *UI) submitMediaDirectory(directory string) {
+	if err := u.session.SetMediaDirectory(directory); err != nil {
+		u.mediaDirectory.SetText(u.session.Snapshot().MediaDirectory)
+		u.showError(err)
+		return
+	}
+	snapshot := u.session.Snapshot()
+	u.mediaDirectory.SetText(snapshot.MediaDirectory)
+	u.refresh(snapshot)
+}
+
 func (u *UI) startProgram() {
 	battery, _ := strconv.Atoi(u.minimumBattery.Text)
 	if err := u.session.Start(session.RunConfig{
@@ -746,13 +760,21 @@ func (u *UI) refresh(snapshot session.Snapshot) {
 		u.logScroll.ScrollToBottom()
 	}
 	u.refreshCamera(snapshot)
-	u.mediaDirectory.SetText(snapshot.MediaDirectory)
+	if u.window.Canvas().Focused() != u.mediaDirectory {
+		u.mediaDirectory.SetText(snapshot.MediaDirectory)
+	}
 	setEnabled(u.loadButton, !snapshot.Running && !snapshot.Connecting)
 	setEnabled(u.editButton, u.programURI != nil)
 	setEnabled(u.connectButton, !snapshot.Connected && !snapshot.Running && !snapshot.Connecting)
 	setEnabled(u.disconnectButton, snapshot.Connected && !snapshot.Running)
 	setEnabled(u.runButton, snapshot.Connected && snapshot.Summary != nil && !snapshot.Running && !snapshot.CameraChanging)
-	setEnabled(u.mediaButton, !snapshot.Running && !snapshot.Connecting)
+	mediaCanChange := !snapshot.Running && !snapshot.Connecting
+	setEnabled(u.mediaButton, mediaCanChange)
+	if mediaCanChange && u.mediaDirectory.Disabled() {
+		u.mediaDirectory.Enable()
+	} else if !mediaCanChange && !u.mediaDirectory.Disabled() {
+		u.mediaDirectory.Disable()
+	}
 	setEnabled(u.stopButton, snapshot.Connected && snapshot.Running)
 	setEnabled(u.landButton, snapshot.Connected)
 	setEnabled(u.emergencyButton, snapshot.Connected)

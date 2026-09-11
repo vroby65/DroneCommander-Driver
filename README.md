@@ -65,7 +65,8 @@ In the application:
 3. Enable simulation mode, connect, and test the program.
 4. For real flight, connect the computer to the `TELLO-...` Wi-Fi network, disable simulation mode, and connect to the drone.
 5. To see the live drone view, enable **Camera** below the lower-right preview. The control is available only with a real Tello connection.
-6. Check the minimum battery threshold, choose whether to land at the end, optionally enable collision checking, and start the program.
+6. Below the camera panel, choose where photos and videos will be saved. Select **Change…** to browse for a local folder, or type an existing folder path in the **Photo/video folder** field and press Enter.
+7. Check the minimum battery threshold, choose whether to land at the end, optionally enable collision checking, and start the program.
 
 When collision checking is enabled, the driver reads the latest ToF distance before translational movements. A reading below 30 cm blocks the movement, activates the normal error recovery and safety landing, and records the intervention in the flight log. While the program is airborne, the same option also monitors the 10 Hz accelerometer telemetry for a likely impact. A sharp acceleration change sends `land` immediately without waiting for the active movement command, cancels the program, and then sends a second confirmed `land`. Takeoff and normal landing are excluded to avoid treating them as impacts. The option is disabled by default.
 
@@ -73,7 +74,9 @@ When collision checking is enabled, the driver reads the latest ToF distance bef
 
 The camera receiver listens on UDP port 11111, sends the Tello SDK `streamon` / `streamoff` commands, and decodes the H.264 feed inside the application. FFmpeg is used when installed because it recovers more reliably from incomplete UDP frames produced by real-world Wi-Fi packet loss; an embedded OpenH264 decoder is retained as a fallback. The preview may remain on during a program run; its checkbox is locked until the run finishes to keep camera commands from interfering with a movement command.
 
-The Drone Commander blocks **Take a photo**, **Start recording**, and **Save recording** use the manually enabled live camera. Photos are saved as timestamped PNG files. Recordings are encoded at 30 fps and saved as timestamped MP4 files when **Save recording** runs. An unfinished recording is discarded when the program stops or ends. Before every real run containing media blocks, the driver asks which folder should receive its photos and recordings; the current destination is also visible and changeable in the flight settings. `~/Pictures/DroneCommander` is only the initial suggestion and can be changed with `-media`.
+The Drone Commander blocks **Take a photo**, **Start recording**, and **Save recording** use the manually enabled live camera. Photos are saved as timestamped PNG files. Recordings are encoded at 30 fps and saved as timestamped MP4 files when **Save recording** runs. An unfinished recording is discarded when the program stops or ends.
+
+The current destination is shown in the **Photo/video folder** field below the camera. Select **Change…** to choose a local folder, or type the path of an existing folder and press Enter. The field and button are disabled while a connection is being established or a program is running, so one recording cannot be split across different locations. Before every real run containing media blocks, the driver asks for final confirmation of the destination. `~/Pictures/DroneCommander` is the initial suggestion and can be changed with `-media`.
 
 Camera preview and photo/video capture are currently supported by the desktop builds. The Android build can run flight programs, but its H.264 camera decoder is not yet available.
 
